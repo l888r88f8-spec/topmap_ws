@@ -59,7 +59,7 @@
 ```text
 topmap_ws/
 ├── src/
-│   ├── topmap_msgs/       # 消息、服务和动作定义
+│   ├── topmap_msgs/       # 消息和服务定义
 │   ├── topmap_core/       # 核心数据类型、参数、错误和序列化
 │   ├── topmap_surface/    # 点云、Mesh、特征和可通行性
 │   ├── topmap_topology/   # Region、瓶颈、Portal 和拓扑压缩
@@ -73,20 +73,12 @@ topmap_ws/
 依赖方向固定为：
 
 ```text
-topmap_msgs
-     ↑
-topmap_core
-   ↑      ↑
-surface  topology
-   └──↑───┘
-    planner
-       ↑
-      ros
-       ↑
-    bringup
+topmap_msgs ───────────────────────┐
+                                  ↓
+topmap_core → surface → topology → planner → ros → bringup
 ```
 
-`topmap_core` 不依赖 ROS 2；算法包只依赖核心类型和必要的几何库；ROS 消息转换集中在 `topmap_ros`。
+`topmap_msgs` 与 `topmap_core` 互不依赖；`topmap_core` 不依赖 ROS 2。算法包只依赖核心类型和必要的几何库，ROS 消息转换集中在 `topmap_ros`。
 
 ## 5. 数据流
 
