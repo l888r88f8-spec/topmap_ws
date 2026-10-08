@@ -20,6 +20,7 @@ find_package(Eigen3 REQUIRED)
 
 add_library(topmap_planner
   src/region_locator.cpp
+  src/topology_astar.cpp
 )
 target_include_directories(topmap_planner PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -50,6 +51,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_region_locator test/test_region_locator.cpp)
   if(TARGET test_region_locator)
     target_link_libraries(test_region_locator topmap_planner)
+  endif()
+  ament_add_gtest(test_topology_astar test/test_topology_astar.cpp)
+  if(TARGET test_topology_astar)
+    target_link_libraries(test_topology_astar topmap_planner)
   endif()
 endif()
 
