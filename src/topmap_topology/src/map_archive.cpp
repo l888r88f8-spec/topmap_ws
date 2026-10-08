@@ -181,6 +181,7 @@ Result<TriangleMesh> ReadMeshSections(const std::vector<std::uint8_t>& vertices_
     if (!vertices_reader.readVector3f(vertex)) return IoError("short read on vertex data");
     vertices.push_back(vertex);
   }
+  if (!vertices_reader.eof()) return IoError("trailing bytes in vertices section");
 
   BinaryReader faces_reader(faces_payload);
   std::uint32_t face_count = 0;
@@ -196,6 +197,7 @@ Result<TriangleMesh> ReadMeshSections(const std::vector<std::uint8_t>& vertices_
     }
     faces.push_back(face);
   }
+  if (!faces_reader.eof()) return IoError("trailing bytes in faces section");
 
   BinaryReader attrs_reader(attrs_payload);
   std::uint32_t attr_count = 0;
@@ -215,6 +217,7 @@ Result<TriangleMesh> ReadMeshSections(const std::vector<std::uint8_t>& vertices_
     }
     attrs.push_back(node);
   }
+  if (!attrs_reader.eof()) return IoError("trailing bytes in triangle_attrs section");
 
   // Reassemble the T11 payload (vertices + per-triangle ids and attributes) and
   // let readTriangleMesh validate and derive adjacency/components.
@@ -243,6 +246,16 @@ Result<TriangleMesh> ReadMeshSections(const std::vector<std::uint8_t>& vertices_
 }  // namespace
 
 Status saveMapArchive(const std::string& path, const MapArchive& archive) {
+  // A newer writer must not emit a file that this build cannot read back: the
+  // version is rejected before any temporary file or target is touched.
+  if (archive.format_version > kTopmapFormatVersion) {
+    return Status::Error(ErrorCode::kSerializationVersionUnsupported,
+                         "refusing to write map archive version " +
+                             std::to_string(archive.format_version) +
+                             " newer than supported version " +
+                             std::to_string(kTopmapFormatVersion));
+  }
+
   BinaryWriter writer;
   writer.writeU32(kTopmapMagic);
   writer.writeU32(archive.format_version);
@@ -430,6 +443,7 @@ Result<MapArchive> loadMapArchive(const std::string& path) {
         !reader.readF64(metadata.build_time_sec) || !reader.readF64(metadata.memory_mb)) {
       return IoError("short read on map metadata counters");
     }
+    if (!reader.eof()) return IoError("trailing bytes in meta section");
   }
 
   Result<TriangleMesh> mesh = ReadMeshSections(sections.at(kSectionVertices),
@@ -450,6 +464,7 @@ Result<MapArchive> loadMapArchive(const std::string& path) {
       if (!ReadRegion(reader, &region)) return IoError("short read on region record");
       regions.push_back(std::move(region));
     }
+    if (!reader.eof()) return IoError("trailing bytes in regions section");
   }
 
   std::vector<Portal> portals;
@@ -465,6 +480,7 @@ Result<MapArchive> loadMapArchive(const std::string& path) {
       if (!ReadPortal(reader, &portal)) return IoError("short read on portal record");
       portals.push_back(std::move(portal));
     }
+    if (!reader.eof()) return IoError("trailing bytes in portals section");
   }
 
   Result<TopologyGraph> built = TopologyGraph::build(regions, portals);
@@ -498,8 +514,13 @@ Result<MapArchive> loadMapArchive(const std::string& path) {
         if (!reader.readI32(origin)) return IoError("short read on origin id");
         if (origin < 0) return IoError("negative origin id");
         const auto inserted = origin_owner.emplace(origin, region_id);
-        if (!inserted.second && inserted.first->second != region_id)
-          return IoError("origin id belongs to more than one region");
+        if (!inserted.second) {
+          if (inserted.first->second != region_id)
+            return IoError("origin id belongs to more than one region");
+          // A repeated origin inside one record would otherwise be silently
+          // collapsed by setOriginRegions' SortUnique.
+          return IoError("duplicate origin id in the graph section");
+        }
         origins.push_back(origin);
       }
       origin_entries.push_back({region_id, std::move(origins)});
@@ -511,12 +532,15 @@ Result<MapArchive> loadMapArchive(const std::string& path) {
     if (!reader.readU32(edge_count)) return IoError("short read on graph edge count");
     if (edge_count > reader.remaining() / (3u * 4u))
       return IoError("edge count exceeds the graph section");
+    std::unordered_set<PortalId> seen_edges;
     for (std::uint32_t i = 0; i < edge_count; ++i) {
       PortalId portal_id = kInvalidId;
       RegionId region_a = kInvalidId;
       RegionId region_b = kInvalidId;
       if (!reader.readI32(portal_id) || !reader.readI32(region_a) || !reader.readI32(region_b))
         return IoError("short read on graph edge");
+      if (!seen_edges.insert(portal_id).second)
+        return IoError("duplicate portal id in the graph edge table");
       const Portal* portal = graph.portal(portal_id);
       if (portal == nullptr) return IoError("graph edge references a missing portal");
       if (!graph.hasRegion(region_a) || !graph.hasRegion(region_b))
@@ -525,6 +549,12 @@ Result<MapArchive> loadMapArchive(const std::string& path) {
                            (portal->region_a == region_b && portal->region_b == region_a);
       if (!matches) return IoError("graph edge disagrees with the portal endpoints");
     }
+    // The edge table must be exactly set-equivalent to the portals section: the
+    // same cardinality, no repeated portal id and, by pigeonhole over the valid
+    // ids above, full coverage. An empty or short table can no longer pass.
+    if (edge_count != graph.portals().size() || seen_edges.size() != graph.portals().size())
+      return IoError("graph edge table does not cover every portal exactly once");
+    if (!reader.eof()) return IoError("trailing bytes in graph section");
 
     // Apply provenance only after the whole graph section validated. Clearing
     // first lets a renumbered super Region absorb an origin whose numeric id is

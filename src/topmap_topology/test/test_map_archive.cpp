@@ -236,6 +236,48 @@ void WriteRegionRecord(BinaryWriter& writer, const SurfaceRegion& region) {
   writer.writeVecI32(region.portal_ids);
 }
 
+struct EdgeRecord {
+  RegionId portal;
+  RegionId region_a;
+  RegionId region_b;
+};
+
+// Rebuilds the graph section payload so a test can express exactly which origin
+// records and edge records appear (including deliberate defects).
+std::vector<std::uint8_t> GraphPayload(
+    const std::vector<std::pair<RegionId, std::vector<RegionId>>>& origin_records,
+    const std::vector<EdgeRecord>& edges) {
+  BinaryWriter writer;
+  writer.writeU32(static_cast<std::uint32_t>(origin_records.size()));
+  for (const auto& record : origin_records) {
+    writer.writeI32(record.first);
+    writer.writeU32(static_cast<std::uint32_t>(record.second.size()));
+    for (const RegionId origin : record.second) writer.writeI32(origin);
+  }
+  writer.writeU32(static_cast<std::uint32_t>(edges.size()));
+  for (const EdgeRecord& edge : edges) {
+    writer.writeI32(edge.portal);
+    writer.writeI32(edge.region_a);
+    writer.writeI32(edge.region_b);
+  }
+  return writer.bytes();
+}
+
+// A valid archive whose two regions are joined by two parallel portals, so the
+// edge table has two records and a duplicate can be injected.
+MapArchive MakeParallelPortalArchive() {
+  MapArchive archive = MakeArchive();
+  SurfaceRegion r0 = R(0);
+  r0.triangle_ids = {0};
+  r0.portal_ids = {0, 1};
+  SurfaceRegion r1 = R(1);
+  r1.triangle_ids = {1};
+  r1.portal_ids = {0, 1};
+  archive.graph = TopologyGraph::build({r0, r1}, {P(0, 0, 1), P(1, 0, 1)}).take();
+  archive.metadata.portal_count = 2;
+  return archive;
+}
+
 }  // namespace
 
 TEST(MapArchiveTest, RoundTripPreservesEveryField) {
@@ -556,5 +598,89 @@ TEST(MapArchiveTest, DuplicateRegionIdsRejected) {
   auto loaded = topmap::loadMapArchive(path);
   ASSERT_FALSE(loaded.ok());
   EXPECT_EQ(loaded.status().code, topmap::ErrorCode::kSerializationIoError);
+  RemoveFile(path);
+}
+
+TEST(MapArchiveTest, MissingEdgeRecordRejected) {
+  // The archive has one portal, but the graph edge table is empty: a defect that
+  // the per-record endpoint check alone cannot see.
+  std::vector<Section> sections = ParseSections(SaveToBytes(MakeArchive()));
+  Section* graph = FindSection(sections, "graph");
+  ASSERT_NE(graph, nullptr);
+  graph->payload = GraphPayload({{0, {0}}, {1, {1}}}, {});
+  const std::string path = TempPath("missingedge");
+  WriteFile(path, BuildFile(sections));
+  auto loaded = topmap::loadMapArchive(path);
+  ASSERT_FALSE(loaded.ok());
+  EXPECT_EQ(loaded.status().code, topmap::ErrorCode::kSerializationIoError);
+  RemoveFile(path);
+}
+
+TEST(MapArchiveTest, DuplicateEdgeRecordRejected) {
+  // Two real portals, but the edge table repeats portal 0 and omits portal 1.
+  std::vector<Section> sections = ParseSections(SaveToBytes(MakeParallelPortalArchive()));
+  Section* graph = FindSection(sections, "graph");
+  ASSERT_NE(graph, nullptr);
+  graph->payload = GraphPayload({{0, {0}}, {1, {1}}}, {{0, 0, 1}, {0, 0, 1}});
+  const std::string path = TempPath("dupedge");
+  WriteFile(path, BuildFile(sections));
+  auto loaded = topmap::loadMapArchive(path);
+  ASSERT_FALSE(loaded.ok());
+  EXPECT_EQ(loaded.status().code, topmap::ErrorCode::kSerializationIoError);
+  RemoveFile(path);
+}
+
+TEST(MapArchiveTest, DuplicateOriginWithinRegionRejected) {
+  // An origin repeated inside one record must be rejected, not silently folded by
+  // setOriginRegions' SortUnique.
+  std::vector<Section> sections = ParseSections(SaveToBytes(MakeArchive()));
+  Section* graph = FindSection(sections, "graph");
+  ASSERT_NE(graph, nullptr);
+  graph->payload = GraphPayload({{0, {0, 0}}, {1, {1}}}, {{0, 0, 1}});
+  const std::string path = TempPath("duporigin");
+  WriteFile(path, BuildFile(sections));
+  auto loaded = topmap::loadMapArchive(path);
+  ASSERT_FALSE(loaded.ok());
+  EXPECT_EQ(loaded.status().code, topmap::ErrorCode::kSerializationIoError);
+  RemoveFile(path);
+}
+
+TEST(MapArchiveTest, KnownSectionTrailingGarbageRejected) {
+  // Every known section must be consumed exactly: same-version garbage may not
+  // ride along inside a parsed payload. Top-level trailing bytes stay allowed.
+  const std::vector<std::uint8_t> bytes = SaveToBytes(MakeArchive());
+  for (const char* name :
+       {"meta", "vertices", "faces", "triangle_attrs", "regions", "portals", "graph"}) {
+    std::vector<Section> sections = ParseSections(bytes);
+    Section* section = FindSection(sections, name);
+    ASSERT_NE(section, nullptr) << name;
+    section->payload.push_back(0xab);
+    const std::string path = TempPath("trailing");
+    WriteFile(path, BuildFile(sections));
+    auto loaded = topmap::loadMapArchive(path);
+    EXPECT_FALSE(loaded.ok()) << "trailing byte accepted in section " << name;
+    if (!loaded.ok()) {
+      EXPECT_EQ(loaded.status().code, topmap::ErrorCode::kSerializationIoError);
+    }
+    RemoveFile(path);
+  }
+}
+
+TEST(MapArchiveTest, FutureVersionSaveDoesNotClobberExistingTarget) {
+  const std::string path = TempPath("futuresave");
+  ASSERT_TRUE(topmap::saveMapArchive(path, MakeArchive()).ok());
+  const std::vector<std::uint8_t> before = ReadFile(path);
+
+  MapArchive future = MakeArchive();
+  future.format_version = topmap::kTopmapFormatVersion + 1;
+  const topmap::Status saved = topmap::saveMapArchive(path, future);
+  ASSERT_FALSE(saved.ok());
+  EXPECT_EQ(saved.code, topmap::ErrorCode::kSerializationVersionUnsupported);
+
+  // The old, readable archive must be untouched.
+  EXPECT_EQ(ReadFile(path), before);
+  auto loaded = topmap::loadMapArchive(path);
+  ASSERT_TRUE(loaded.ok()) << loaded.status().message;
+  EXPECT_EQ(loaded.value().format_version, topmap::kTopmapFormatVersion);
   RemoveFile(path);
 }

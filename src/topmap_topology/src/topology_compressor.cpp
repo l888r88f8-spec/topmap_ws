@@ -193,8 +193,12 @@ Result<std::pair<TopologyGraph, CompressionStats>> TopologyCompressor::compress(
   stats.portals_before = static_cast<int>(graph.portals().size());
 
   TopologyGraph current = graph;
-  // Each region is rejected for a given cause at most once, which both keeps the
-  // counters exact and guarantees the loop cannot spin on the same state.
+  // Rejection verdicts are scoped to a single graph state: after every successful
+  // contraction the statistics, origins and portal adjacency of the surviving
+  // regions have changed, so a region rejected earlier must be re-evaluated in
+  // the new state. Within one state each cause is recorded at most once. These
+  // caches are not what guarantees termination: a round that applies no merge
+  // stops the loop, and every applied merge removes exactly one Region.
   std::unordered_set<RegionId> invariant_rejected;
   std::unordered_set<RegionId> regime_rejected;
   std::unordered_set<RegionId> cost_rejected;
@@ -281,8 +285,16 @@ Result<std::pair<TopologyGraph, CompressionStats>> TopologyCompressor::compress(
         ++stats.rejected_by_invariant;
       }
     }
-    if (merged) continue;  // degrees changed -> recompute candidates
-    break;                 // nothing applied: stop, the remaining rejects are counted
+    if (merged) {
+      // The graph changed, so every rejection verdict above is stale. Discard
+      // them and let all still existing Regions be re-evaluated against the new
+      // state (statistics, origins and portal adjacency all moved).
+      invariant_rejected.clear();
+      regime_rejected.clear();
+      cost_rejected.clear();
+      continue;  // degrees changed -> recompute candidates
+    }
+    break;  // nothing applied: stop, the remaining rejects are counted
   }
 
   stats.regions_after = static_cast<int>(current.regions().size());

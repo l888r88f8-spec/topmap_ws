@@ -135,6 +135,48 @@ TEST(TopologyCompressorTest, UniqueCrossLayerPortalSurvives) {
   EXPECT_GE(out.value().first.portals().size(), 1u);
 }
 
+TEST(TopologyCompressorTest, ProtectedRegionIsReevaluatedAfterStateChange) {
+  // Regression: rejection was cached for the whole run, so a Region protected in
+  // one graph state stayed permanently skipped even after another merge changed
+  // its statistics/adjacency. Layout (a path, every edge a bridge):
+  //   Y(3, z=3) -- X(0, z=0) -- W(2, z=[0,3.2]) -- V(1, z=0)
+  // X's bridge to the high band Y is the only cross-layer portal, so X is
+  // protected while W is not. W merges into X (target), expanding X's z-span so
+  // that (X,Y) is no longer cross-layer. X must then be re-evaluated and merged
+  // into Y; the stale cache would stop after a single merge.
+  SurfaceRegion x = R(0, 0.0f);
+  x.centroid = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+  SurfaceRegion v = R(1, 0.0f);
+  v.centroid = Eigen::Vector3f(100.0f, 0.0f, 0.0f);
+  SurfaceRegion w = R(2, 0.0f);
+  w.max_z = 3.2f;
+  w.centroid = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+  SurfaceRegion y = R(3, 3.0f);
+  y.centroid = Eigen::Vector3f(0.0f, 0.0f, 3.0f);
+  auto g = TopologyGraph::build({x, v, w, y}, {P(0, 0, 3), P(1, 0, 2), P(2, 2, 1)}).take();
+
+  // Sanity: X carries the unique cross-layer bridge and W does not.
+  ASSERT_EQ(TopologyInvariants::uniqueCrossLayerPortals(g).size(), 1u);
+  EXPECT_EQ(TopologyInvariants::capture(g).cycle_rank, 0);
+
+  CompressionParams c;
+  c.max_merge_cost = 100.0f;
+  c.preserve_topology = true;
+  auto out = TopologyCompressor().compress(g, c, kRegionParams);
+  ASSERT_TRUE(out.ok()) << out.status().message;
+  const CompressionStats& stats = out.value().second;
+  // W -> X, then the super Region -> Y: two merges in two distinct states.
+  EXPECT_EQ(stats.merges_applied, 2);
+  EXPECT_EQ(stats.regions_after, 2);
+  EXPECT_EQ(RegionIds(out.value().first), (std::vector<RegionId>{1, 3}));
+  EXPECT_LE(stats.rejected_by_invariant + stats.rejected_by_regime, stats.merges_rejected);
+  std::string reason;
+  EXPECT_TRUE(TopologyInvariants::sameConnectivity(TopologyInvariants::capture(g),
+                                                   TopologyInvariants::capture(out.value().first),
+                                                   &reason))
+      << reason;
+}
+
 TEST(TopologyCompressorTest, LoopIsNotCollapsedIntoTree) {
   // Four-region loop, all degree 2; compression may remove regions but the
   // cycle_rank must stay 1.
