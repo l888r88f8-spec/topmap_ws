@@ -22,6 +22,7 @@ add_library(topmap_planner
   src/region_locator.cpp
   src/topology_astar.cpp
   src/corridor_builder.cpp
+  src/surface_astar.cpp
 )
 target_include_directories(topmap_planner PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -60,6 +61,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_corridor_builder test/test_corridor_builder.cpp)
   if(TARGET test_corridor_builder)
     target_link_libraries(test_corridor_builder topmap_planner)
+  endif()
+  ament_add_gtest(test_surface_astar test/test_surface_astar.cpp)
+  if(TARGET test_surface_astar)
+    target_link_libraries(test_surface_astar topmap_planner)
   endif()
 endif()
 
