@@ -15,9 +15,12 @@ namespace topmap {
 float regionJoinScore(const TriangleNode& a, const TriangleNode& b, const RegionParams& p);
 
 // Traversability-constrained region growing (T13). Seeds are the unassigned
-// robot-placeable triangles, taken by descending area then ascending id, and
+// traversable triangles, taken by descending area then ascending id, and
 // expanded best-first while the join score stays below the threshold, the edge
-// is traversable and the region stays slope/height homogeneous.
+// is traversable and the region stays slope/height homogeneous. Placeability
+// (min_clearance >= required_clearance) is deliberately NOT applied here: it is
+// T16's and the path validator's hard constraint, and eroding the Region early
+// would corrupt T16's region-union width field.
 class RegionGrower {
  public:
   Result<std::vector<SurfaceRegion>> grow(const TriangleMesh& mesh,

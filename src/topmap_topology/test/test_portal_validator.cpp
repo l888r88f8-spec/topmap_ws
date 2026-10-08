@@ -26,7 +26,6 @@ using topmap::PointId;
 using topmap::Portal;
 using topmap::PortalExtractor;
 using topmap::PortalParams;
-using topmap::PortalRejection;
 using topmap::PortalRejectionReason;
 using topmap::PortalValidationReport;
 using topmap::PortalValidator;
@@ -325,9 +324,13 @@ TEST(PortalValidatorTest, ValidWidthFollowsUnionBoundaryGeometry) {
   EXPECT_GT(b.value()[0].valid_width, a.value()[0].valid_width);
 }
 
-TEST(PortalValidatorTest, NarrowestChainSampleDeterminesValidWidth) {
+TEST(PortalValidatorTest, PortalWidthIsTheWidestCrossingLimitedByTheNarrowerSide) {
   // The ring chain is a closed loop whose samples have different free widths.
-  // valid_width must be the minimum over the chain, not the maximum.
+  // valid_width must be the best (widest) crossing - the bottleneck - and each
+  // crossing's local width must use the NARROWER of its two sides, never the
+  // more open one. Sampling the wall-adjacent chain vertices would instead give
+  // the spurious one-cell 0.067 m minimum, which is exactly what the
+  // region-union bottleneck rule exists to avoid.
   RobotParams robot;
   PortalParams params;
   params.boundary_min_edges = 1;
@@ -346,34 +349,35 @@ TEST(PortalValidatorTest, NarrowestChainSampleDeterminesValidWidth) {
     const PointId y = candidate.boundary_chain[k];
     chain_edges.insert({std::min(x, y), std::max(x, y)});
   }
-  float sampled_min = std::numeric_limits<float>::infinity();
-  float sampled_max = -1.0f;
+  const auto in_region = [](const SurfaceRegion& r, topmap::TriangleId t) {
+    return std::find(r.triangle_ids.begin(), r.triangle_ids.end(), t) != r.triangle_ids.end();
+  };
+  float narrow_side_max = -1.0f;   // max over chain of 2 * min(side_a, side_b)
+  float wide_side_max = -1.0f;     // max over chain of 2 * max(side_a, side_b)
+  float narrow_side_min = std::numeric_limits<float>::infinity();
   for (topmap::TriangleId t = 0; t < static_cast<topmap::TriangleId>(ring.mesh.size()); ++t) {
-    const bool t_in_a =
-        std::find(ring.regions[0].triangle_ids.begin(), ring.regions[0].triangle_ids.end(), t) !=
-        ring.regions[0].triangle_ids.end();
-    if (!t_in_a) continue;
+    if (!in_region(ring.regions[0], t)) continue;
     for (const topmap::TriangleEdge& e : ring.mesh.triangle(t).edges) {
       const topmap::TriangleId u = e.neighbor;
-      if (u == topmap::kInvalidId) continue;
-      const bool u_in_b =
-          std::find(ring.regions[1].triangle_ids.begin(), ring.regions[1].triangle_ids.end(), u) !=
-          ring.regions[1].triangle_ids.end();
-      if (!u_in_b) continue;
+      if (u == topmap::kInvalidId || !in_region(ring.regions[1], u)) continue;
       if (chain_edges.count({std::min(e.v0, e.v1), std::max(e.v0, e.v1)}) == 0) continue;
-      const float local = std::min(2.0f * distance[t], 2.0f * distance[u]);
-      sampled_min = std::min(sampled_min, local);
-      sampled_max = std::max(sampled_max, local);
+      const float a = 2.0f * distance[t];
+      const float b = 2.0f * distance[u];
+      narrow_side_max = std::max(narrow_side_max, std::min(a, b));
+      wide_side_max = std::max(wide_side_max, std::max(a, b));
+      narrow_side_min = std::min(narrow_side_min, std::min(a, b));
     }
   }
-  ASSERT_LT(sampled_min, sampled_max) << "fixture must expose a narrow and a wide chain sample";
+  ASSERT_LT(narrow_side_min, narrow_side_max) << "fixture must expose a narrow and a wide crossing";
+  ASSERT_LT(narrow_side_max, wide_side_max) << "fixture must expose two unequal sides";
 
   auto validated =
       PortalValidator().validate(ring.mesh, ring.regions, extracted.value(), robot, params);
   ASSERT_TRUE(validated.ok()) << validated.status().message;
   ASSERT_EQ(validated.value().size(), 1u);
-  EXPECT_NEAR(validated.value()[0].valid_width, sampled_min, 1e-4f);
-  EXPECT_LT(validated.value()[0].valid_width, sampled_max);
+  EXPECT_NEAR(validated.value()[0].valid_width, narrow_side_max, 1e-4f);
+  EXPECT_LT(validated.value()[0].valid_width, wide_side_max)
+      << "the wider side of a crossing must not set the portal width";
 }
 
 TEST(PortalValidatorTest, StepRejects) {
@@ -471,13 +475,12 @@ TEST(PortalValidatorTest, ChainThatDoesNotMatchTheInterfaceIsRejected) {
   EXPECT_EQ(detail.value().rejections[0].reason, PortalRejectionReason::kInvalidChain);
 }
 
-TEST(PortalValidatorTest, FrozenScenesPinExtractionCountsAndUnionWidthOutcome) {
-  // R15 freezes the extracted portal counts. Under the plan's region-union width
-  // rule the sampled center-band width is below the 0.90 gate for these scenes:
-  // T14 keeps only robot-placeable triangles in a Region, so the union boundary
-  // sits on the required_clearance contour rather than on the mesh wall. This
-  // test pins the extraction contract and the conservative validation outcome;
-  // the implementation never special-cases a scene name or coordinate.
+TEST(PortalValidatorTest, FrozenScenesValidateEveryPortal) {
+  // R15: after T16 the four frozen scenes must keep 2/2/4/8 portals and every
+  // one must survive with valid_width > required_width (0.90) and
+  // min_clearance >= required_clearance (0.45). valid_width is the region-union
+  // bottleneck and min_clearance the R8 footprint-erosion yardstick. No scene
+  // name, coordinate or target count enters the production code.
   const std::vector<std::pair<SyntheticScene, std::size_t>> frozen = {
       {SyntheticScene::kHallNarrowHall, 2u},
       {SyntheticScene::kSingleBridge, 2u},
@@ -491,18 +494,64 @@ TEST(PortalValidatorTest, FrozenScenesPinExtractionCountsAndUnionWidthOutcome) {
     auto extracted = PortalExtractor().extract(prepared.mesh, prepared.regions, params);
     ASSERT_TRUE(extracted.ok()) << topmap::toString(entry.first) << ": "
                                 << extracted.status().message;
-    EXPECT_EQ(extracted.value().size(), entry.second) << topmap::toString(entry.first);
+    ASSERT_EQ(extracted.value().size(), entry.second) << topmap::toString(entry.first);
 
-    auto detail = PortalValidator().validateDetailed(prepared.mesh, prepared.regions,
-                                                     extracted.value(), robot, params);
-    ASSERT_TRUE(detail.ok()) << topmap::toString(entry.first) << ": " << detail.status().message;
-    std::set<topmap::PortalId> seen;
-    for (const Portal& portal : detail.value().portals) seen.insert(portal.id);
-    for (const PortalRejection& rejection : detail.value().rejections) seen.insert(rejection.id);
-    EXPECT_EQ(seen.size(), extracted.value().size())
-        << topmap::toString(entry.first) << ": a candidate was silently dropped";
-    EXPECT_TRUE(detail.value().portals.empty())
-        << topmap::toString(entry.first) << ": union-width rule should reject these candidates";
+    auto validated = PortalValidator().validate(prepared.mesh, prepared.regions,
+                                                extracted.value(), robot, params);
+    ASSERT_TRUE(validated.ok()) << topmap::toString(entry.first) << ": "
+                                << validated.status().message;
+    EXPECT_EQ(validated.value().size(), entry.second) << topmap::toString(entry.first);
+    std::set<topmap::PortalId> ids;
+    for (const Portal& portal : validated.value()) {
+      const std::string tag = topmap::toString(entry.first) + " portal " + std::to_string(portal.id);
+      ids.insert(portal.id);
+      EXPECT_GT(portal.valid_width, robot.required_width()) << tag;
+      EXPECT_GE(portal.min_clearance, robot.required_clearance()) << tag;
+      EXPECT_LE(portal.mean_slope, robot.max_slope_rad()) << tag;
+      EXPECT_LE(portal.max_step, robot.max_step_height) << tag;
+      EXPECT_GE(portal.traversal_cost, 1.0f) << tag;
+      EXPECT_FALSE(portal.is_critical) << tag;
+    }
+    EXPECT_EQ(ids.size(), entry.second) << topmap::toString(entry.first) << ": duplicate portal id";
+  }
+}
+
+TEST(PortalValidatorTest, AllScenesMatchFrozenRegionAndPortalCounts) {
+  // Item 6 of the review: the whole frozen R15 table, not just the four scenes.
+  struct Row {
+    SyntheticScene scene;
+    std::size_t regions;
+    std::size_t portals;
+  };
+  const std::vector<Row> table = {
+      {SyntheticScene::kFlatPlane, 1u, 0u},
+      {SyntheticScene::kRamp, 3u, 2u},
+      {SyntheticScene::kOverlappingFloors, 2u, 0u},
+      {SyntheticScene::kMultiLevelRamps, 5u, 4u},
+      {SyntheticScene::kHallNarrowHall, 3u, 2u},
+      {SyntheticScene::kUShape, 3u, 2u},
+      {SyntheticScene::kTShape, 4u, 3u},
+      {SyntheticScene::kSingleBridge, 3u, 2u},
+      {SyntheticScene::kParallelPortals, 4u, 4u},
+      {SyntheticScene::kLoop, 8u, 8u}};
+  RobotParams robot;
+  PortalParams params;
+  for (const Row& row : table) {
+    const std::string tag = topmap::toString(row.scene);
+    const Prepared prepared = Split(row.scene, RegionParams{});
+    ASSERT_TRUE(prepared.ok) << tag << ": " << prepared.error;
+    EXPECT_EQ(prepared.regions.size(), row.regions) << tag;
+    auto extracted = PortalExtractor().extract(prepared.mesh, prepared.regions, params);
+    if (row.portals == 0u) {
+      EXPECT_FALSE(extracted.ok()) << tag << ": a disconnected scene must have no portal";
+      continue;
+    }
+    ASSERT_TRUE(extracted.ok()) << tag << ": " << extracted.status().message;
+    EXPECT_EQ(extracted.value().size(), row.portals) << tag;
+    auto validated =
+        PortalValidator().validate(prepared.mesh, prepared.regions, extracted.value(), robot, params);
+    ASSERT_TRUE(validated.ok()) << tag << ": " << validated.status().message;
+    EXPECT_EQ(validated.value().size(), row.portals) << tag;
   }
 }
 
@@ -515,12 +564,15 @@ TEST(PortalValidatorTest, ParallelPortalsAreNotMergedByValidation) {
   ASSERT_TRUE(extracted.ok()) << extracted.status().message;
   ASSERT_EQ(extracted.value().size(), 4u);
 
-  auto detail = PortalValidator().validateDetailed(prepared.mesh, prepared.regions,
-                                                   extracted.value(), robot, params);
-  ASSERT_TRUE(detail.ok()) << detail.status().message;
+  auto validated =
+      PortalValidator().validate(prepared.mesh, prepared.regions, extracted.value(), robot, params);
+  ASSERT_TRUE(validated.ok()) << validated.status().message;
+  ASSERT_EQ(validated.value().size(), 4u);
   std::set<topmap::PortalId> ids;
-  for (const Portal& portal : detail.value().portals) ids.insert(portal.id);
-  for (const PortalRejection& rejection : detail.value().rejections) ids.insert(rejection.id);
+  for (const Portal& portal : validated.value()) {
+    ids.insert(portal.id);
+    EXPECT_GT(portal.valid_width, robot.required_width()) << "portal " << portal.id;
+  }
   EXPECT_EQ(ids.size(), 4u);  // parallel portals stay distinct; merging is a T17 concern
 }
 

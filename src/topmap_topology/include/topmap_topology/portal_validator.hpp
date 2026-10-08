@@ -11,7 +11,7 @@ namespace topmap {
 
 // R8: free width around `seed`, measured with regionBoundaryDistance restricted
 // to the region-union subgraph. This is the local width field primitive; a
-// Portal's `valid_width` is the narrowest such sample along its boundary chain.
+// Portal's `valid_width` is the best (widest) crossing over its boundary chain.
 float portalLocalWidth(const TriangleMesh& mesh, const std::vector<TriangleId>& region_union,
                        TriangleId seed);
 
@@ -44,8 +44,10 @@ struct PortalValidationReport {
 // T16: robot-aware Portal validation. Candidate geometry is re-checked against
 // the mesh and the region partition:
 //   * valid_width is recomputed from the region-union boundary-distance field
-//     at the portal crossing (never copied from the raw boundary-chain length),
-//     and the rule
+//     at the portal crossing (never carried over from the raw boundary-chain
+//     length, never TriangleNode.min_clearance). For each crossing edge the
+//     narrower of the two sides sets the local width; the portal takes the
+//     widest crossing (bottleneck). The rule
 //     `valid_width > robot.required_width() + params.width_margin` is strict;
 //   * mean_slope <= robot.max_slope_rad();
 //   * max_step <= robot.max_step_height;

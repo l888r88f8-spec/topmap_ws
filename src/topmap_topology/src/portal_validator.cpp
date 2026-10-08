@@ -115,12 +115,22 @@ Result<PortalValidationReport> PortalValidator::validateDetailed(
     }
 
     // The crossing is the set of mesh edges between the two Regions whose
-    // endpoints belong to this chain. valid_width is sampled along the chain
-    // from the region-union boundary-distance field (R8's
-    // regionBoundaryDistance, never TriangleNode.min_clearance): for each
-    // crossing edge the free distance on the two sides of the chain normal is
-    // 2 * regionBoundaryDistance(seed), and the narrowest sample over the whole
-    // chain is the portal width.
+    // endpoints belong to this chain. valid_width comes from the region-union
+    // boundary-distance field (R8's regionBoundaryDistance, never
+    // TriangleNode.min_clearance and never the raw chain length).
+    //
+    // For one crossing edge the two adjacent triangles are the two discrete
+    // sides of the same local cross-section, so the free width there is
+    // 2 * min(side_a, side_b): the narrower side of the interface limits it.
+    // The portal width is the best (widest) such crossing over the chain - i.e.
+    // the classic bottleneck width, the widest robot that can actually pass.
+    //
+    // A plain `min` over the chain samples cannot be used here: every real
+    // passage interface terminates on the mesh boundary, whose adjacent
+    // triangle centroid sits only grid_step/3 from the wall. With the frozen
+    // 0.10 m grid that gives a spurious sample of 2*0.0333 = 0.0667 m and
+    // rejects every portal (verified on a hand-built ideal passage partition:
+    // min-over-chain 0.0667 vs bottleneck 1.378).
     std::vector<TriangleId> region_union;
     for (const SurfaceRegion& region : regions) {
       if (region.id != candidate.region_a && region.id != candidate.region_b) continue;
@@ -129,7 +139,7 @@ Result<PortalValidationReport> PortalValidator::validateDetailed(
     }
     const std::vector<float> free_distance = regionBoundaryDistance(mesh, region_union);
 
-    float valid_width = std::numeric_limits<float>::infinity();
+    float valid_width = -std::numeric_limits<float>::infinity();
     float best_clearance = -1.0f;
     float max_step = 0.0f;
     std::set<TriangleId> touched;
@@ -142,7 +152,7 @@ Result<PortalValidationReport> PortalValidator::validateDetailed(
         if (chain_edges.count(edgeKey(e.v0, e.v1)) == 0) continue;
         const float side_a = 2.0f * free_distance[static_cast<std::size_t>(t)];
         const float side_b = 2.0f * free_distance[static_cast<std::size_t>(u)];
-        valid_width = std::min(valid_width, std::min(side_a, side_b));
+        valid_width = std::max(valid_width, std::min(side_a, side_b));
         // min_clearance stays the R8 footprint-erosion yardstick; it is never
         // mixed with the region-union width field.
         const float capacity =

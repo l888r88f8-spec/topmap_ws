@@ -108,10 +108,15 @@ Result<std::vector<SurfaceRegion>> RegionGrower::grow(const TriangleMesh& mesh,
   const float ramp_slope_rad = params.ramp_slope_deg * 3.14159265358979323846f / 180.0f;
 
   const TriangleId count = static_cast<TriangleId>(mesh.size());
-  std::vector<char> placeable(count, 0);
+  // T13: region growing is constrained by surface traversability only. The
+  // footprint-clearance gate (isRobotPlaceable) belongs to T16 and to path
+  // validation (R10); eroding the Region here would shrink the union boundary
+  // that T16's regionBoundaryDistance width field is measured against, and turn
+  // every 1.2 m passage into a ~0.3 m one. So a traversable-but-not-placeable
+  // boundary band stays inside the Region.
+  std::vector<char> traversable(count, 0);
   for (TriangleId id = 0; id < count; ++id) {
-    placeable[id] =
-        TraversabilityEvaluator::isRobotPlaceable(mesh.triangle(id), tp) ? 1 : 0;
+    traversable[id] = mesh.triangle(id).traversable ? 1 : 0;
   }
   std::vector<char> assigned(count, 0);
 
@@ -119,7 +124,7 @@ Result<std::vector<SurfaceRegion>> RegionGrower::grow(const TriangleMesh& mesh,
   std::vector<TriangleId> seed_order;
   seed_order.reserve(count);
   for (TriangleId id = 0; id < count; ++id) {
-    if (placeable[id]) seed_order.push_back(id);
+    if (traversable[id]) seed_order.push_back(id);
   }
   std::sort(seed_order.begin(), seed_order.end(), [&mesh](TriangleId a, TriangleId b) {
     const float area_a = mesh.triangle(a).area;
@@ -143,7 +148,7 @@ Result<std::vector<SurfaceRegion>> RegionGrower::grow(const TriangleMesh& mesh,
     const auto push_neighbors = [&](TriangleId from) {
       for (const TriangleEdge& e : mesh.triangle(from).edges) {
         const TriangleId to = e.neighbor;
-        if (to == kInvalidId || assigned[to] || !placeable[to] || !e.traversable) continue;
+        if (to == kInvalidId || assigned[to] || !traversable[to] || !e.traversable) continue;
         frontier.push({normalizedJoinScore(mesh.triangle(from), mesh.triangle(to), params, tp),
                        to});
       }
@@ -154,7 +159,7 @@ Result<std::vector<SurfaceRegion>> RegionGrower::grow(const TriangleMesh& mesh,
       const Item item = frontier.top();
       frontier.pop();
       const TriangleId candidate = item.second;
-      if (assigned[candidate] || !placeable[candidate]) continue;
+      if (assigned[candidate] || !traversable[candidate]) continue;
       const TriangleNode& t = mesh.triangle(candidate);
       if (item.first >= params.region_score_threshold) continue;
 
@@ -191,7 +196,7 @@ Result<std::vector<SurfaceRegion>> RegionGrower::grow(const TriangleMesh& mesh,
 
   if (regions.empty()) {
     return Status::Error(ErrorCode::kRegionGrowingFailed,
-                         "no robot-placeable region met the size thresholds");
+                         "no traversable region met the size thresholds");
   }
   return regions;
 }

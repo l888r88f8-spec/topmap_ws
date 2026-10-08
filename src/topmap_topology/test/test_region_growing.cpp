@@ -31,6 +31,34 @@ topmap::TriangleNode FlatTriangle(Eigen::Vector3f c) {
   return t;
 }
 
+// A flat `side` x `side` square tessellated on a `step` grid. Small enough that
+// every triangle is traversable (slope/roughness/curvature clear) yet no
+// triangle reaches the 0.45 m footprint clearance. The T13 contract keeps such
+// triangles inside the Region; the T16 validator is what later rejects a
+// crossing that cannot fit the footprint.
+topmap::TriangleMesh NarrowFlatMesh(float side, float step) {
+  topmap::MeshData d;
+  const int n = static_cast<int>(std::lround(side / step));
+  std::vector<std::vector<topmap::PointId>> ids(n + 1, std::vector<topmap::PointId>(n + 1));
+  for (int j = 0; j <= n; ++j) {
+    for (int i = 0; i <= n; ++i) {
+      ids[i][j] = static_cast<topmap::PointId>(d.vertices.size());
+      d.vertices.emplace_back(i * step, j * step, 0.0f);
+    }
+  }
+  for (int j = 0; j < n; ++j) {
+    for (int i = 0; i < n; ++i) {
+      d.faces.push_back({ids[i][j], ids[i + 1][j], ids[i + 1][j + 1]});
+      d.faces.push_back({ids[i][j], ids[i + 1][j + 1], ids[i][j + 1]});
+    }
+  }
+  auto mr = topmap::TriangleMesh::fromMeshData(d, {});
+  EXPECT_TRUE(mr.ok()) << mr.status().message;
+  topmap::TriangleMesh m = mr.take();
+  topmap::TraversabilityEvaluator::apply(m, topmap::TraversabilityParams{});
+  return m;
+}
+
 // Every region must be connected through shared edges (R20) and the regions
 // must partition the triangle set without overlap.
 void ExpectRegionsConnectedAndDisjoint(const topmap::TriangleMesh& mesh,
@@ -131,12 +159,56 @@ TEST(RegionGrowTest, GrownRegionsAreEdgeConnected) {
     auto r = topmap::RegionGrower().grow(m, p);
     ASSERT_TRUE(r.ok()) << topmap::toString(s) << ": " << r.status().message;
     ExpectRegionsConnectedAndDisjoint(m, r.value());
-    // Every region triangle must be robot-placeable.
+    // T13 grows on surface traversability; the footprint-clearance gate is
+    // T16/R10, not a Region-membership rule.
     for (const auto& region : r.value()) {
       for (topmap::TriangleId id : region.triangle_ids) {
-        EXPECT_TRUE(topmap::TraversabilityEvaluator::isRobotPlaceable(
-            m.triangle(id), topmap::TraversabilityParams{}));
+        EXPECT_TRUE(m.triangle(id).traversable);
       }
+    }
+  }
+}
+
+TEST(RegionGrowTest, TraversableBandWithoutFootprintClearanceStaysInRegion) {
+  // Every triangle here is traversable but none is robot-placeable: the 0.8 m
+  // square has a maximum boundary distance of 0.4 m < required_clearance 0.45.
+  topmap::TriangleMesh m = NarrowFlatMesh(0.8f, 0.1f);
+  const topmap::TraversabilityParams tp{};
+  int traversable = 0;
+  int placeable = 0;
+  for (const auto& t : m.triangles()) {
+    if (t.traversable) ++traversable;
+    if (topmap::TraversabilityEvaluator::isRobotPlaceable(t, tp)) ++placeable;
+  }
+  ASSERT_GT(traversable, 0);
+  EXPECT_EQ(placeable, 0) << "fixture must not contain a robot-placeable triangle";
+
+  topmap::RegionParams p;
+  auto r = topmap::RegionGrower().grow(m, p);
+  ASSERT_TRUE(r.ok()) << r.status().message;
+  ASSERT_EQ(r.value().size(), 1u);
+  EXPECT_EQ(r.value()[0].triangle_ids.size(), m.size())
+      << "traversable-but-not-placeable triangles must stay in the Region";
+  for (topmap::TriangleId id : r.value()[0].triangle_ids) {
+    EXPECT_TRUE(m.triangle(id).traversable);
+    EXPECT_FALSE(topmap::TraversabilityEvaluator::isRobotPlaceable(m.triangle(id), tp));
+  }
+}
+
+TEST(RegionGrowTest, NonTraversableTrianglesNeverEnterARegion) {
+  topmap::TriangleMesh m = NarrowFlatMesh(0.8f, 0.1f);
+  // Flag two triangles as non-traversable after the evaluator ran.
+  ASSERT_GE(m.size(), 2u);
+  m.triangles()[0].traversable = false;
+  m.triangles()[1].traversable = false;
+
+  topmap::RegionParams p;
+  auto r = topmap::RegionGrower().grow(m, p);
+  ASSERT_TRUE(r.ok()) << r.status().message;
+  for (const auto& region : r.value()) {
+    for (topmap::TriangleId id : region.triangle_ids) {
+      EXPECT_TRUE(m.triangle(id).traversable)
+          << "triangle " << id << " is non-traversable but entered a Region";
     }
   }
 }

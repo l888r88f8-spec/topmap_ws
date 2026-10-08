@@ -1004,7 +1004,21 @@ std::vector<std::vector<TriangleId>> splitConcaveOne(
   if (blocked.empty()) return {ids};
 
   std::vector<std::vector<TriangleId>> blocks = edgeComponents(mesh, ids, &blocked);
-  return mergeFragments(mesh, ids, std::move(blocks), params.min_side_area);
+  // A concave cut that clips a reflex corner can leave a block that is not a
+  // real limb: with the full traversable Region (T13 no longer erodes the
+  // clearance band) the U-shape corner [0,1]x[0,1] survives as its own block.
+  // Merge blocks that are small against the region's own block-size scale so a
+  // corner fragment folds back into the limb it came from, while a genuine
+  // limb (T-shape arm) stays. The threshold is relative, never coordinate- or
+  // scene-based.
+  double block_area_total = 0.0;
+  for (const std::vector<TriangleId>& block : blocks) {
+    for (TriangleId t : block) block_area_total += mesh.triangle(t).area;
+  }
+  const float mean_block_area =
+      blocks.empty() ? 0.0f : static_cast<float>(block_area_total / blocks.size());
+  const float merge_area = std::max(params.min_side_area, 0.5f * mean_block_area);
+  return mergeFragments(mesh, ids, std::move(blocks), merge_area);
 }
 
 std::vector<SurfaceRegion> normalize(const TriangleMesh& mesh,
