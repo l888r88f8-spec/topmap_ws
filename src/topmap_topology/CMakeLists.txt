@@ -25,6 +25,7 @@ add_library(topmap_topology
   src/topology_graph.cpp
   src/topology_invariants.cpp
   src/topology_compressor.cpp
+  src/map_archive.cpp
 )
 target_include_directories(topmap_topology PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -78,6 +79,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_topology_compressor test/test_topology_compressor.cpp)
   if(TARGET test_topology_compressor)
     target_link_libraries(test_topology_compressor topmap_topology)
+  endif()
+  ament_add_gtest(test_map_archive test/test_map_archive.cpp)
+  if(TARGET test_map_archive)
+    target_link_libraries(test_map_archive topmap_topology)
   endif()
 endif()
 
