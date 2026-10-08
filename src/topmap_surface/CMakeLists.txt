@@ -25,6 +25,7 @@ add_library(topmap_surface
   src/triangulator.cpp
   src/traversability.cpp
   src/mesh_serialization.cpp
+  src/synthetic_scene.cpp
 )
 target_include_directories(topmap_surface PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -45,6 +46,12 @@ install(
   RUNTIME DESTINATION bin
 )
 install(DIRECTORY include/ DESTINATION include)
+
+# R18: acceptance scripts invoke this through `ros2 run topmap_surface ...`, so
+# the executable must be installed into the package lib directory.
+add_executable(write_synthetic_pcd tools/write_synthetic_pcd.cpp)
+target_link_libraries(write_synthetic_pcd topmap_surface)
+install(TARGETS write_synthetic_pcd DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(ament_cmake topmap_core Eigen3 PCL CGAL)
@@ -74,6 +81,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_mesh_serialization test/test_mesh_serialization.cpp)
   if(TARGET test_mesh_serialization)
     target_link_libraries(test_mesh_serialization topmap_surface)
+  endif()
+  ament_add_gtest(test_synthetic_scene test/test_synthetic_scene.cpp)
+  if(TARGET test_synthetic_scene)
+    target_link_libraries(test_synthetic_scene topmap_surface)
   endif()
 endif()
 
