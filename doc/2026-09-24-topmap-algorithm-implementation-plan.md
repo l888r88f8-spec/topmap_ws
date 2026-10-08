@@ -379,6 +379,9 @@ struct PortalParams {
 };
 struct CompressionParams {
   float max_merge_cost = 0.25f;   bool preserve_topology = true;
+  // R12-b：硬禁止跨坡度体制合并。为 true 时，平地 Region 与坡道 Region
+  // 即使几何代价低于 max_merge_cost 也不得合并，以保护 T14 建立的 is_ramp 语义。
+  bool forbid_cross_regime_merge = true;
 };
 struct PlanParams {
   float max_project_radius = 0.30f;
@@ -416,7 +419,7 @@ topmap:
                  min_region_triangles, bottleneck_ratio, bottleneck_abs_ceiling, min_side_area,
                  concavity_branch_min_arm_length, concavity_branch_angle_deg, ramp_slope_deg}
   portal:       {boundary_min_edges, width_margin}
-  compression:  {max_merge_cost, preserve_topology}
+  compression:  {max_merge_cost, preserve_topology, forbid_cross_regime_merge}
   plan:         {max_project_radius, max_project_normal_diff_deg, corridor_expansion_rings,
                  fallback_full_mesh, shortcut_enabled, funnel_enabled, smoothing_enabled,
                  smoothing_iterations, check_step, topology_weight}
@@ -447,6 +450,7 @@ topmap:
 | 新增 `region.concavity_branch_*` | — | 1.00 / 60.0 | 见 R5 |
 | 新增 `plan.max_project_normal_diff_deg` | — | 45.0 | 见 R6（规格 §7.6 第 1 条的「法向一致性」初稿未实现） |
 | 新增 `map.keep_raw_cloud` | — | `true` | 见 R4（规格 §7.1 第 6 条初稿无对应任务） |
+| 新增 `compression.forbid_cross_regime_merge` | — | `true` | 见 R12-b：防止压缩抹掉 T14 建立的 `is_ramp` 语义 |
 
 **R1-b 平地↔坡道过渡豁免：** 初稿 `max_slope_diff_deg = 15°` 会把任何「平地↔坡道」交界边判为不可通行——即使坡道本身坡度合法，也接不上平台，导致 `kRamp` 场景分裂为两个互不连通的分量。同时 `max_normal_diff_deg = 30°` 在平面过渡上与 `max_slope_diff` 是同一个量，后者严格更紧使前者完全失效。修订：坡度差超限时，若法向差与高度突变均合法，仍判为连续（`allow_slope_transition`）。
 
@@ -754,12 +758,20 @@ class TopologyInvariants {
   // 唯一跨层连接：两端 Region 的高度区间不重叠，且是该分量内连接这两个高度带的唯一 Portal
   static std::vector<PortalId> uniqueCrossLayerPortals(const TopologyGraph& graph);
 };
+// R12-b：坡度体制判定。两 Region 是否同属平地体制或同属坡道体制。
+// 判据优先用 is_ramp 标志（T14 的 splitRamps 已置位），回退到 mean_slope 与
+// ramp_slope_deg 比较，使该函数对未经分裂的 Region 也可用。
+bool sameSlopeRegime(const SurfaceRegion& a, const SurfaceRegion& b, const RegionParams& params);
 struct CompressionStats { int regions_before = 0, regions_after = 0, portals_before = 0,
-                              portals_after = 0, merges_applied = 0, merges_rejected = 0; };
+                              portals_after = 0, merges_applied = 0, merges_rejected = 0;
+                          // R12-b：按原因区分拒绝，便于诊断压缩为何无收益
+                          int rejected_by_invariant = 0, rejected_by_regime = 0; };
 class TopologyCompressor {
  public:
-  Result<std::pair<TopologyGraph, CompressionStats>> compress(const TopologyGraph& graph,
-                                                              const CompressionParams& params) const;
+  // R12-b：需要 RegionParams 以判定坡度体制（sameSlopeRegime 的回退判据用 ramp_slope_deg）
+  Result<std::pair<TopologyGraph, CompressionStats>> compress(
+      const TopologyGraph& graph, const CompressionParams& params,
+      const RegionParams& region_params) const;
 };
 }  // namespace topmap
 
@@ -1182,6 +1194,7 @@ TEST(ParamsTest, LoadsAllSections) {
   EXPECT_TRUE(cfg.value().plan.fallback_full_mesh);
   EXPECT_TRUE(cfg.value().traversability.allow_slope_transition);
   EXPECT_TRUE(cfg.value().map.keep_raw_cloud);
+  EXPECT_TRUE(cfg.value().compression.forbid_cross_regime_merge);   // R12-b
 }
 TEST(ParamsTest, DerivedQuantitiesAreComputedNotRead) {
   // R1：派生量不出现在 YAML，由 robot 推导
@@ -1352,9 +1365,10 @@ Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
 
   n = t["compression"];
   if (auto s = rejectUnknown(n, "topmap.compression",
-      {"max_merge_cost","preserve_topology"}); !s.ok()) return s;
+      {"max_merge_cost","preserve_topology","forbid_cross_regime_merge"}); !s.ok()) return s;
   REQ(c.compression.max_merge_cost, n, "max_merge_cost", "topmap.compression");
   REQ_B(c.compression.preserve_topology, n, "preserve_topology", "topmap.compression");
+  REQ_B(c.compression.forbid_cross_regime_merge, n, "forbid_cross_regime_merge", "topmap.compression");
 
   n = t["plan"];
   if (auto s = rejectUnknown(n, "topmap.plan",
@@ -2413,6 +2427,17 @@ TEST(TopologyInvariantsTest, DegreeTwoRegionIsContractibleButArticulation) {
   // 度 1 的端点不可收缩
   EXPECT_NE(std::find(blocked.begin(), blocked.end(), 0), blocked.end());
 }
+TEST(TopologyInvariantsTest, SlopeRegimeDistinguishesRampFromFlat) {
+  // R12-b：坡度体制判定是跨坡道合并禁令的基础
+  const topmap::RegionParams rp;
+  topmap::SurfaceRegion flat_a = R(0), flat_b = R(1);
+  topmap::SurfaceRegion ramp = R(2);
+  ramp.is_ramp = true;
+  ramp.mean_slope = 12.0f * static_cast<float>(M_PI) / 180.0f;
+  EXPECT_TRUE(topmap::sameSlopeRegime(flat_a, flat_b, rp));
+  EXPECT_FALSE(topmap::sameSlopeRegime(flat_a, ramp, rp));
+  EXPECT_TRUE(topmap::sameSlopeRegime(ramp, ramp, rp));
+}
 TEST(TopologyInvariantsTest, UniqueCrossLayerPortalIsProtected) {
   // region 0 在 z=0，region 1 在 z=3，唯一 Portal 连接两个高度带
   auto g = topmap::TopologyGraph::build({R(0, 0.0f), R(1, 3.0f)}, {P(0, 0, 1)}).take();
@@ -2485,14 +2510,22 @@ topmap::SurfaceRegion R(int id, float z = 0.0f) {
   r.mean_slope = 0.0f; r.roughness = 0.0f;
   return r;
 }
+// R12-b：坡道 Region（is_ramp 置位 + 坡度在坡道体制内）
+topmap::SurfaceRegion Ramp(int id, float z = 0.0f) {
+  topmap::SurfaceRegion r = R(id, z);
+  r.is_ramp = true;
+  r.mean_slope = 12.0f * static_cast<float>(M_PI) / 180.0f;
+  return r;
+}
 topmap::Portal P(int id, int a, int b) {
   topmap::Portal p; p.id = id; p.region_a = a; p.region_b = b; p.valid_width = 1.5f; return p;
 }
+const topmap::RegionParams kRegionParams;
 }  // namespace
 TEST(TopologyCompressorTest, DegreeTwoChainRegionMerges) {
   auto g = topmap::TopologyGraph::build({R(0), R(1), R(2)}, {P(0, 0, 1), P(1, 1, 2)}).take();
   topmap::CompressionParams c; c.max_merge_cost = 1.0f;
-  auto out = topmap::TopologyCompressor().compress(g, c);
+  auto out = topmap::TopologyCompressor().compress(g, c, kRegionParams);
   ASSERT_TRUE(out.ok()) << out.status().message;
   EXPECT_EQ(out.value().second.regions_before, 3);
   EXPECT_EQ(out.value().second.regions_after, 2);
@@ -2505,7 +2538,7 @@ TEST(TopologyCompressorTest, DegreeTwoChainRegionMerges) {
 TEST(TopologyCompressorTest, OriginReachabilityIsPreservedAfterMerge) {
   auto g = topmap::TopologyGraph::build({R(0), R(1), R(2)}, {P(0, 0, 1), P(1, 1, 2)}).take();
   topmap::CompressionParams c; c.max_merge_cost = 1.0f;
-  auto out = topmap::TopologyCompressor().compress(g, c);
+  auto out = topmap::TopologyCompressor().compress(g, c, kRegionParams);
   ASSERT_TRUE(out.ok());
   // 三个原始 id 在压缩后仍必须可查到所属超级 Region，且彼此可达
   const auto& ng = out.value().first;
@@ -2521,7 +2554,7 @@ TEST(TopologyCompressorTest, UniqueCrossLayerPortalSurvives) {
   auto g = topmap::TopologyGraph::build({R(0, 0.0f), R(1, 0.0f), R(2, 3.0f)},
                                         {P(0, 0, 1), P(1, 1, 2)}).take();
   topmap::CompressionParams c; c.max_merge_cost = 100.0f; c.preserve_topology = true;
-  auto out = topmap::TopologyCompressor().compress(g, c);
+  auto out = topmap::TopologyCompressor().compress(g, c, kRegionParams);
   ASSERT_TRUE(out.ok());
   auto cross = topmap::TopologyInvariants::uniqueCrossLayerPortals(out.value().first);
   EXPECT_EQ(cross.size(), 1u) << "unique cross-layer connection was lost";
@@ -2532,19 +2565,57 @@ TEST(TopologyCompressorTest, LoopIsNotCollapsedIntoTree) {
   auto g = topmap::TopologyGraph::build({R(0), R(1), R(2), R(3)},
                                         {P(0, 0, 1), P(1, 1, 2), P(2, 2, 3), P(3, 3, 0)}).take();
   topmap::CompressionParams c; c.max_merge_cost = 1.0f;
-  auto out = topmap::TopologyCompressor().compress(g, c);
+  auto out = topmap::TopologyCompressor().compress(g, c, kRegionParams);
   ASSERT_TRUE(out.ok());
   auto before = topmap::TopologyInvariants::capture(g);
   auto after = topmap::TopologyInvariants::capture(out.value().first);
   EXPECT_EQ(after.cycle_rank, before.cycle_rank);
+}
+TEST(TopologyCompressorTest, RampIsNotMergedIntoFlatRegion) {
+  // R12-b：平地(0) - 坡道(1) - 平地(2)，坡道度为 2 且几何代价可能很低，
+  // 但合并会抹掉 is_ramp 语义，必须结构性禁止（不受 max_merge_cost 影响）。
+  auto g = topmap::TopologyGraph::build({R(0), Ramp(1), R(2)}, {P(0, 0, 1), P(1, 1, 2)}).take();
+  topmap::CompressionParams c;
+  c.max_merge_cost = 1000.0f;              // 代价闸门完全放开
+  c.forbid_cross_regime_merge = true;
+  auto out = topmap::TopologyCompressor().compress(g, c, kRegionParams);
+  ASSERT_TRUE(out.ok()) << out.status().message;
+  EXPECT_EQ(out.value().second.merges_applied, 0);
+  EXPECT_GE(out.value().second.rejected_by_regime, 1);
+  EXPECT_EQ(out.value().first.regions().size(), 3u);
+  // 坡道语义必须存活
+  int ramps = 0;
+  for (const auto& r : out.value().first.regions()) if (r.is_ramp) ++ramps;
+  EXPECT_EQ(ramps, 1);
+}
+TEST(TopologyCompressorTest, CostGateAloneWouldNotProtectRamp) {
+  // R12-b 的反证：关掉硬禁令后，同一张图在放开代价闸门时坡道会被吞掉。
+  // 这正是初稿「只靠 merge_cost 惩罚」不足的证据。
+  auto g = topmap::TopologyGraph::build({R(0), Ramp(1), R(2)}, {P(0, 0, 1), P(1, 1, 2)}).take();
+  topmap::CompressionParams c;
+  c.max_merge_cost = 1000.0f;
+  c.forbid_cross_regime_merge = false;     // 退化为初稿行为
+  auto out = topmap::TopologyCompressor().compress(g, c, kRegionParams);
+  ASSERT_TRUE(out.ok()) << out.status().message;
+  EXPECT_EQ(out.value().second.merges_applied, 1);
+  EXPECT_EQ(out.value().first.regions().size(), 2u);
+}
+TEST(TopologyCompressorTest, FlatChainStillMergesWhenProhibitionIsOn) {
+  // R12-b 不得误伤同体制合并：全平地的度 2 链仍必须正常压缩
+  auto g = topmap::TopologyGraph::build({R(0), R(1), R(2)}, {P(0, 0, 1), P(1, 1, 2)}).take();
+  topmap::CompressionParams c; c.max_merge_cost = 1.0f; c.forbid_cross_regime_merge = true;
+  auto out = topmap::TopologyCompressor().compress(g, c, kRegionParams);
+  ASSERT_TRUE(out.ok()) << out.status().message;
+  EXPECT_EQ(out.value().second.merges_applied, 1);
+  EXPECT_EQ(out.value().second.rejected_by_regime, 0);
 }
 TEST(TopologyCompressorTest, PreserveTopologyDisabledAllowsMoreMerges) {
   auto g = topmap::TopologyGraph::build({R(0, 0.0f), R(1, 0.0f), R(2, 3.0f)},
                                         {P(0, 0, 1), P(1, 1, 2)}).take();
   topmap::CompressionParams strict; strict.max_merge_cost = 100.0f; strict.preserve_topology = true;
   topmap::CompressionParams loose;  loose.max_merge_cost = 100.0f;  loose.preserve_topology = false;
-  auto a = topmap::TopologyCompressor().compress(g, strict);
-  auto b = topmap::TopologyCompressor().compress(g, loose);
+  auto a = topmap::TopologyCompressor().compress(g, strict, kRegionParams);
+  auto b = topmap::TopologyCompressor().compress(g, loose, kRegionParams);
   ASSERT_TRUE(a.ok()); ASSERT_TRUE(b.ok());
   EXPECT_GE(a.value().second.merges_rejected, 1);
   EXPECT_LE(b.value().second.regions_after, a.value().second.regions_after);
@@ -2553,9 +2624,18 @@ TEST(TopologyCompressorTest, PreserveTopologyDisabledAllowsMoreMerges) {
 - [ ] **步骤 2 运行并确认失败**：`BUILD/TEST topmap_topology test_topology_compressor`。
 - [ ] **步骤 3 最小实现**：
   - 候选集 = `regions \ nonContractibleRegions(graph)`（R12）。即度恰为 2、两 Portal 通向不同邻居、且不携带唯一跨层 Portal 的 Region。
+  - **R12-b（硬禁止跨坡度体制合并）**：当 `params.forbid_cross_regime_merge == true` 时，候选 R 与目标邻居 A 必须满足 `sameSlopeRegime(R, A, region_params)`，否则该 (R → A) 方向直接不可合并。若 R 的两个邻居体制都与 R 不同，则 R 整体退出候选集。
+    理由：仅靠 `merge_cost` 的坡度差项只是让跨坡道合并「变贵」而非「被禁止」——阈值调松或坡度差较小时（例如 8° 坡道与平地）仍会发生，从而抹掉 T14 的 `splitRamps` 费力建立的 `is_ramp` 语义。后续若依赖 `is_ramp` 做速度规划或分层可视化，这类静默丢失很难排查。改为结构性禁止，不受阈值影响。
+    注意 `TopologyCompressor::compress` 因此需要 `RegionParams`（`sameSlopeRegime` 的回退判据要 `ramp_slope_deg`），签名更新（A4.7 已同步）：
+```cpp
+Result<std::pair<TopologyGraph, CompressionStats>> compress(
+    const TopologyGraph& graph, const CompressionParams& params,
+    const RegionParams& region_params) const;
+```
   - `merge_cost = w_n * |Δnormal| / pi + w_s * |Δmean_slope| / max_slope + w_r * |Δroughness| / max_roughness + |centroid_a - centroid_b| / sqrt(max(area_a, area_b))`，各项归一化后相加（与 R1 的量纲归一一致）；`cost > max_merge_cost` 的候选直接跳过。
   - 按 `(cost, region_id)` 升序处理。对每个候选 R（邻居 A、B）：把 R 并入 A，删除 Portal(A,R)，把 Portal(R,B) 改接为 Portal(A,B)，`originRegions(A) += originRegions(R)`（R23），重编号后 `replaceRegionsPortals` 重建。
-  - `preserve_topology == true` 时 `capture` 前后签名并 `sameConnectivity`；失败 → 回滚本次收缩，`merges_rejected++`；成功 → `merges_applied++`。每次收缩后重新计算候选集（度数已变）。
+  - `preserve_topology == true` 时 `capture` 前后签名并 `sameConnectivity`；失败 → 回滚本次收缩，`merges_rejected++` 且 `rejected_by_invariant++`；成功 → `merges_applied++`。每次收缩后重新计算候选集（度数已变）。
+  - **R12-b（拒绝原因计数）**：被体制禁令挡掉的候选计 `merges_rejected++` 且 `rejected_by_regime++`。两个计数器的意义是：压缩无收益时可以立刻区分「不变量太严」和「体制禁令生效」，否则只看 `merges_rejected` 无法定位（初稿即无此区分）。不变式：`rejected_by_invariant + rejected_by_regime <= merges_rejected`（代价闸门挡掉的候选只计入 `merges_rejected`）。
   - 返回 `(graph, stats)`；`regions_before/after`、`portals_before/after` 据实填写。
 - [ ] **步骤 4 运行并通过**：`BUILD/TEST topmap_topology test_topology_compressor`。
 - [ ] **步骤 5 提交**：`git add src/topmap_topology && git commit -m "feat(topology): add topology-preserving region compression with rollback"`
@@ -3185,7 +3265,7 @@ TEST(MapBuilderNodeTest, BuildsMapFromPcdAndReportsStats) {
 
 **R35（执行器模式）**：所有 `topmap_ros` 的服务测试统一采用「被测节点 + 独立客户端节点 + `MultiThreadedExecutor` + 后台 spin 线程」的模式，并在断言后 `exec.cancel(); spinner.join();`。建议把这段样板封装成 `test_support_ros.hpp` 里的辅助函数 `callService<SrvT>(server_node, service_name, request, timeout)`，T30/T31/T32 共用，避免三处各写一遍。
 - [ ] **步骤 2 运行并确认失败**：`BUILD/TEST topmap_ros test_map_builder_node`。
-- [ ] **步骤 3 最小实现**：`MapBuilderNode` 声明参数 `pcd_path`、`output_map_path`、`config_file`、`frame_id`；构造时 `loadTopmapConfig`，创建服务 `/topmap/build_map`（`BuildMap.srv`），发布 `/topmap/original_cloud`（`sensor_msgs/PointCloud2`）、`/topmap/regions`、`/topmap/portals`、`/topmap/map_stats`。`handleBuildMap` 依次调用 `PointCloudProcessor → SurfaceFeatureEstimator → SurfaceTriangulator → TriangleMesh::fromMeshData → TraversabilityEvaluator::apply → RegionGrower → RegionSplitter → PortalExtractor → PortalValidator → TopologyGraph::build → TopologyCompressor → saveMapArchive`，失败时把 `static_cast<int32_t>(code)` 与 `toString(code)` 填入响应；成功发布 markers 与 stats。
+- [ ] **步骤 3 最小实现**：`MapBuilderNode` 声明参数 `pcd_path`、`output_map_path`、`config_file`、`frame_id`；构造时 `loadTopmapConfig`，创建服务 `/topmap/build_map`（`BuildMap.srv`），发布 `/topmap/original_cloud`（`sensor_msgs/PointCloud2`）、`/topmap/regions`、`/topmap/portals`、`/topmap/map_stats`。`handleBuildMap` 依次调用 `PointCloudProcessor → SurfaceFeatureEstimator → SurfaceTriangulator → TriangleMesh::fromMeshData → TraversabilityEvaluator::apply → RegionGrower → RegionSplitter → PortalExtractor → PortalValidator → TopologyGraph::build → TopologyCompressor(compression, region) → saveMapArchive`（**R12-b**：压缩需同时传 `CompressionParams` 与 `RegionParams`），失败时把 `static_cast<int32_t>(code)` 与 `toString(code)` 填入响应；成功发布 markers 与 stats。
 
   **R7（特征链路）**：`SurfaceFeatureEstimator` 的 `roughness`/`curvature` 必须通过 `SurfaceTriangulator::triangulate` 的可选入参传入，再由 `fromMeshData` 落到 `TriangleNode`。初稿这条链路断开，导致可通行性判据中的两项恒真 —— 这是本任务最容易漏掉的接线。
   **R4（原始点云复核）**：当 `map.keep_raw_cloud == true` 时，保留降采样**之前**的点云，供 Portal 宽度与台阶高度在原始分辨率下复核（规格 §7.1 第 6 条）。体素降采样后若不保留，该复核无从进行。
@@ -3450,8 +3530,8 @@ PY
 | `PortalExtractor::extract` / `PortalValidator::validate` | `topology/portal_*.hpp` | T15,T16,T21,T30 | ✅ |
 | `SurfaceRegion/Portal` | `topology/region_types.hpp` | T14–T33 | ✅（`Portal.valid_width` 与 `msg/Portal.msg valid_width` 同名，T29 转换字段一一对应） |
 | `TopologyGraph::build` 及访问器 | `topology/topology_graph.hpp` | T17–T31 | ✅（测试用 `portalsOf/neighborRegions/otherRegion/connectedComponents/region/portal/regionOfTriangle`） |
-| `TopologyInvariants::{capture,sameConnectivity,bridgePortals,articulationRegions,nonContractibleRegions,uniqueCrossLayerPortals}` + `GraphSignature` | `topology/topology_invariants.hpp` | T18,T19 | ✅（**R11/R12/R21** 重定义 `GraphSignature` 为基于原始 Region 可达性，新增 `nonContractibleRegions`、`uniqueCrossLayerPortals`、`cycle_rank`） |
-| `TopologyCompressor::compress` 返回 `Result<std::pair<TopologyGraph,CompressionStats>>` | `topology/topology_compressor.hpp` | T19,T30 | ✅（测试用 `.value().first/.second`） |
+| `TopologyInvariants::{capture,sameConnectivity,bridgePortals,articulationRegions,nonContractibleRegions,uniqueCrossLayerPortals}` + `sameSlopeRegime` + `GraphSignature` | `topology/topology_invariants.hpp` | T18,T19 | ✅（**R11/R12/R21** 重定义 `GraphSignature` 为基于原始 Region 可达性，新增 `nonContractibleRegions`、`uniqueCrossLayerPortals`、`cycle_rank`；**R12-b** 新增自由函数 `sameSlopeRegime`） |
+| `TopologyCompressor::compress` 返回 `Result<std::pair<TopologyGraph,CompressionStats>>` | `topology/topology_compressor.hpp` | T19,T30 | ✅（测试用 `.value().first/.second`；**R12-b** 增 `RegionParams` 形参，`CompressionStats` 增 `rejected_by_invariant`/`rejected_by_regime`） |
 | `saveMapArchive/loadMapArchive/MapArchive/MapMetadata` | `topology/map_archive.hpp` | T20,T30,T31 | ✅（**R14** `MapMetadata` 补 `point_count/connected_components/regions_before_compression/memory_mb`，初稿这些 `MapStats.msg` 字段在 C++ 侧无来源） |
 | `PlanRequest/TopologyPath/PlanStats/PlanResult/PathValidationReport/Corridor` | `planner/plan_types.hpp` | T21–T31 | ✅ |
 | `RegionLocator/TopologyAStar/CorridorBuilder/SurfaceAStar/PathOptimizer/SafetyValidator/HierarchicalPlanner` | 各自头文件 | T21–T31 | ✅（`SurfaceAStar::search` 参数统一为 `waypoints`；**R6** `RegionLocator::locate` 第四参改 `const PlanParams&`；**R10** `SurfaceAStar::search` 增 `TraversabilityParams`；**R1** `SafetyValidator::validate`/`PathOptimizer::*` 改收 `RobotParams`、去掉 `curvature_limit`；**R1** `HierarchicalPlanner` 构造改收 `TopmapConfig`） |
@@ -3492,6 +3572,7 @@ PY
 | R10 | 规格未落地 | 规格 §7.2 的 `C_support` 完全缺失，A* 可贴边界走到 T26 才发现不合格 | 新增 `isRobotPlaceable`，clearance 并入搜索硬约束 | A4.6,T10,T13,T21,T24,T25 |
 | R11 | 硬矛盾 | 不变量定义在「id 集合哈希 + 桥集合」上，而压缩就是合并重编号 → 每次合并必回滚，T19 不可能通过 | 改为基于原始 Region 可达性的签名 | A4.7,T18,T19 |
 | R12 | 硬矛盾 | 用 `articulationRegions` 筛压缩候选，但链上每个度 2 节点都是割点 → 候选恒空，与规格 §7.5 直接冲突 | 新增 `nonContractibleRegions`（收缩≠删除） | A4.7,T18,T19 |
+| R12-b | 语义丢失 | 跨坡道合并仅靠 `merge_cost` 惩罚是「变贵」而非「禁止」，坡度差较小时（如 8° 坡道）仍会发生，静默抹掉 T14 建立的 `is_ramp` 语义 | 新增 `forbid_cross_regime_merge`（默认 true）与 `sameSlopeRegime`，改为结构性禁止；`CompressionStats` 按原因区分拒绝 | A4.4,A4.7,T03,T18,T19,T30 |
 | R13 | 规格未落地 | 验收指标 A-03 要求 Portal 顺序一致率 100%，但无任何判定算法 | 新增 `crossedPortals`/`portalOrderMatches` | A4.8,T24,T26,T28,T33 |
 | R14 | 工程 | `MapStats.msg` 有 4 个字段在 `MapMetadata` 中无来源，T29 填不出 | 补齐 `MapMetadata` | A4.7,T20,T29 |
 | R15 | 硬矛盾 | 场景无坐标定义，但 T25/T32/T33 硬编码绝对坐标；T13–T28 的期望值全靠场景几何 | 冻结 10 场景坐标表 | T12 及其下游全部 |
@@ -3577,7 +3658,7 @@ PY
 | M0 环境就绪 | T01 步骤 0 | 系统依赖（CGAL/PCL/Eigen/yaml-cpp/Boost.Graph）就位 | T01 步骤 0 的验证脚本输出 `SYSTEM DEPS OK` 且退出码 0（R24：实测 CGAL 缺失，此闸门不可跳过） |
 | M1 骨架与契约 | T01–T05 | 7 个可构建包、`topmap_msgs` 接口、`topmap_core` 错误/ID/参数/二进制/几何 | `colcon build --packages-up-to topmap_core` 成功；`colcon test --packages-select topmap_core --event-handlers console_direct+` 全绿 |
 | M2 地表建模 | T06–T12 | 点云预处理、点特征、共享边 Mesh、三角化、可通行性、Mesh 序列化、10 个合成场景 | `colcon test --packages-select topmap_surface` 全绿；`test_synthetic_scene` 的 10 个场景全部生成成功 |
-| M3 拓扑地图 | T13–T20 | Region 生长/分裂、Portal 提取/验证、二部图、不变量、压缩、`topmap_map.bin` 归档 | `colcon test --packages-select topmap_topology` 全绿；`overlapping_floors` 跨层错误连接数为 0；压缩前后**原始 Region 可达性**与 `cycle_rank` 保持（R11/R21）；`loop`/`t_shape` 上 `merges_applied >= 1`（R12，防压缩退化为空操作）；`ramp` 坡道 Region 数 = 1（R2） |
+| M3 拓扑地图 | T13–T20 | Region 生长/分裂、Portal 提取/验证、二部图、不变量、压缩、`topmap_map.bin` 归档 | `colcon test --packages-select topmap_topology` 全绿；`overlapping_floors` 跨层错误连接数为 0；压缩前后**原始 Region 可达性**与 `cycle_rank` 保持（R11/R21）；`loop`/`t_shape` 上 `merges_applied >= 1`（R12，防压缩退化为空操作）；`ramp` 坡道 Region 数 = 1 且压缩后仍为 1（R2/R12-b） |
 | M4 分层规划 | T21–T28 | 起终点定位、Topology A*、Corridor、Surface A*、路径优化、安全复核、分层规划器、基准 | `colcon test --packages-select topmap_planner` 全绿；`test_hierarchical_planner` 端到端规划成功且降级链被覆盖；`benchmark_runner` 输出 CSV |
 | M5 ROS 与验收 | T29–T33 | 类型/Marker 转换、`MapBuilderNode`、`PlannerNode`、YAML/launch/RViz、验收脚本与报告 | `colcon test --packages-select topmap_ros` 全绿；`ros2 launch topmap_bringup topmap_offline_build.launch.py --show-args` 与 `topmap_online_plan.launch.py --show-args` 退出码 0；`bash src/topmap_bringup/scripts/run_acceptance.sh` 末行 `ACCEPTANCE OK` |
 
@@ -3597,7 +3678,7 @@ PY
 | A-08 | 单元测试通过率 | 全部算法包与 ROS 包 gtest 通过比例 | 100% | `colcon test-result --verbose` | T01–T33 |
 | A-09 | 不可达场景的正确拒绝 | `overlapping_floors` 必须返回 `kTopologyUnreachable`(602) 而非找到路径 | 100%（**R32** 新增：初稿把该场景与 `all(success==1)` 并列，自相矛盾） | T27 测试与 T33 脚本 | T22,T27,T33 |
 | A-10 | 压缩有效性 | 多区域场景压缩后 `regions_after < regions_before` | 至少在 `loop`/`t_shape` 上成立（**R12** 新增：初稿候选规则使压缩恒为空操作，需有指标防回归） | T19 测试与 T28 CSV | T19,T28,T33 |
-| A-11 | 坡道完整性 | `ramp` 场景的坡道必须是单一 `is_ramp` Region，不得碎片化 | 坡道 Region 数 = 1（**R2** 新增） | T13,T14 测试 | T13,T14 |
+| A-11 | 坡道完整性 | `ramp` 场景的坡道必须是单一 `is_ramp` Region，不得碎片化，且**压缩后仍存活** | 坡道 Region 数 = 1，压缩前后均成立（**R2** 新增，**R12-b** 扩展到压缩阶段） | T13,T14,T19 测试与 T33 脚本 | T13,T14,T19 |
 
 ---
 
@@ -3618,7 +3699,8 @@ PY
 | 依赖版本漂移 | PCL/CGAL/Boost 版本不一致导致编译或数值差异 | 构建失败或结果不稳定 | 固定 ROS 2 Humble 源与 `cmake_minimum_required(VERSION 3.14)`，在 `package.xml` 声明最低版本，CI 全量构建 | 构建期失败并给出包名 | T01,T32 |
 | 系统依赖缺失 | CGAL 未安装（**实测本机即如此**，R24） | T09 无法开始，整个 M2 阻塞 | T01 步骤 0 安装并逐头文件验证，输出 `SYSTEM DEPS OK` 才进入后续任务 | 步骤 0 退出码非零 | T01 |
 | 分裂判据不收敛 | 瓶颈/凹形判据在真实地图上切得过碎或完全不切（R3/R5 换判据后仍可能需调参） | Region 数量失控，压缩与规划性能恶化 | 合成场景的期望区域数作为回归基线（R15 冻结表）；真实地图先用合成场景标定 `bottleneck_ratio` 与 `concavity_branch_*` | 回归测试失败即阻止合并 | T12,T14 |
-| 压缩退化为空操作 | 候选规则或不变量过严（初稿即如此，R11/R12） | 拓扑压缩无收益，课题指标不成立 | 指标 A-10 要求多区域场景 `regions_after < regions_before`，作为防回归闸门 | 验收断言失败 | T19,T33 |
+| 压缩退化为空操作 | 候选规则或不变量过严（初稿即如此，R11/R12） | 拓扑压缩无收益，课题指标不成立 | 指标 A-10 要求多区域场景 `regions_after < regions_before`，作为防回归闸门；`CompressionStats` 按原因区分拒绝（R12-b）便于定位是不变量还是体制禁令导致 | 验收断言失败 | T19,T33 |
+| 坡道语义被压缩抹掉 | 跨坡度体制合并（仅靠代价惩罚不足，R12-b） | `is_ramp` 静默丢失，后续速度规划/分层可视化失效且难排查 | `forbid_cross_regime_merge` 默认 true 做结构性禁止；指标 A-11 要求压缩后坡道仍存活 | 候选在该方向直接不可合并，计入 `rejected_by_regime` | T19,T33 |
 | 坡道碎片化 | 高度跨度约束作用于同坡度体制内（初稿即如此，R2） | 坡道被切成多段，Portal 数量爆炸 | 指标 A-11 要求 ramp 场景坡道 Region 数 = 1 | 回归测试失败 | T13,T14 |
 
 ---
