@@ -14,15 +14,18 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(ament_cmake REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 add_library(topmap_core
   src/error.cpp
   src/params.cpp
+  src/binary_io.cpp
 )
 target_include_directories(topmap_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_compile_features(topmap_core PUBLIC cxx_std_17)
+target_link_libraries(topmap_core PUBLIC Eigen3::Eigen)
 target_link_libraries(topmap_core PRIVATE yaml-cpp)
 
 if(BUILD_TESTING)
@@ -35,6 +38,10 @@ if(BUILD_TESTING)
   if(TARGET test_params)
     target_link_libraries(test_params topmap_core)
     set_tests_properties(test_params PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
+  ament_add_gtest(test_binary_io test/test_binary_io.cpp)
+  if(TARGET test_binary_io)
+    target_link_libraries(test_binary_io topmap_core)
   endif()
 endif()
 
