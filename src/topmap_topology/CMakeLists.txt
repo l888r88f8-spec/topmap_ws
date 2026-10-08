@@ -20,6 +20,7 @@ find_package(Eigen3 REQUIRED)
 add_library(topmap_topology
   src/region_growing.cpp
   src/region_split.cpp
+  src/portal_extractor.cpp
 )
 target_include_directories(topmap_topology PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -53,6 +54,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_region_split test/test_region_split.cpp)
   if(TARGET test_region_split)
     target_link_libraries(test_region_split topmap_topology)
+  endif()
+  ament_add_gtest(test_portal_extractor test/test_portal_extractor.cpp)
+  if(TARGET test_portal_extractor)
+    target_link_libraries(test_portal_extractor topmap_topology)
   endif()
 endif()
 
