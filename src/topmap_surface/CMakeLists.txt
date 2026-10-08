@@ -13,9 +13,41 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(ament_cmake REQUIRED)
+find_package(topmap_core REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io filters)
+
+add_library(topmap_surface
+  src/point_cloud_processor.cpp
+)
+target_include_directories(topmap_surface PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_include_directories(topmap_surface SYSTEM PUBLIC ${PCL_INCLUDE_DIRS})
+target_compile_features(topmap_surface PUBLIC cxx_std_17)
+target_link_libraries(topmap_surface PUBLIC topmap_core::topmap_core Eigen3::Eigen ${PCL_LIBRARIES})
+target_compile_options(topmap_surface PUBLIC ${PCL_DEFINITIONS})
+
+# Install the library and its public headers, then export the target so that
+# downstream ament packages can find_package(topmap_surface) and link it.
+install(
+  TARGETS topmap_surface
+  EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+install(DIRECTORY include/ DESTINATION include)
+
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_dependencies(ament_cmake topmap_core Eigen3 PCL)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_point_cloud_processor test/test_point_cloud_processor.cpp)
+  if(TARGET test_point_cloud_processor)
+    target_link_libraries(test_point_cloud_processor topmap_surface)
+  endif()
 endif()
 
 ament_package()
