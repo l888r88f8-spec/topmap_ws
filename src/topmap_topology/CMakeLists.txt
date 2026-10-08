@@ -22,6 +22,7 @@ add_library(topmap_topology
   src/region_split.cpp
   src/portal_extractor.cpp
   src/portal_validator.cpp
+  src/topology_graph.cpp
 )
 target_include_directories(topmap_topology PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -63,6 +64,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_portal_validator test/test_portal_validator.cpp)
   if(TARGET test_portal_validator)
     target_link_libraries(test_portal_validator topmap_topology)
+  endif()
+  ament_add_gtest(test_topology_graph test/test_topology_graph.cpp)
+  if(TARGET test_topology_graph)
+    target_link_libraries(test_topology_graph topmap_topology)
   endif()
 endif()
 
