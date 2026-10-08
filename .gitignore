@@ -1,0 +1,6 @@
+.worktrees/
+build/
+install/
+log/
+benchmark/results/*.csv
+test_data/maps/*.bin
