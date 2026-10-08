@@ -15,10 +15,11 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 find_package(ament_cmake REQUIRED)
 find_package(topmap_core REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common io filters)
+find_package(PCL REQUIRED COMPONENTS common io filters features search kdtree)
 
 add_library(topmap_surface
   src/point_cloud_processor.cpp
+  src/surface_features.cpp
 )
 target_include_directories(topmap_surface PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -47,6 +48,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_point_cloud_processor test/test_point_cloud_processor.cpp)
   if(TARGET test_point_cloud_processor)
     target_link_libraries(test_point_cloud_processor topmap_surface)
+  endif()
+  ament_add_gtest(test_surface_features test/test_surface_features.cpp)
+  if(TARGET test_surface_features)
+    target_link_libraries(test_surface_features topmap_surface)
   endif()
 endif()
 
