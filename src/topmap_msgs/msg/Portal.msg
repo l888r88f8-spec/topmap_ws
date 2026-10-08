@@ -1,0 +1,13 @@
+int32 id
+int32 region_a
+int32 region_b
+geometry_msgs/Point left
+geometry_msgs/Point right
+geometry_msgs/Point center
+float32 raw_width
+float32 valid_width
+float32 mean_slope
+float32 max_step
+float32 min_clearance
+float32 traversal_cost
+bool is_critical

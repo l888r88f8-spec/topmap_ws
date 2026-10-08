@@ -1,0 +1,7 @@
+string pcd_path
+string output_map_path
+---
+bool success
+topmap_msgs/MapStats stats
+int32 error_code
+string error_message

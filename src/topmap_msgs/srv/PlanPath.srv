@@ -1,0 +1,9 @@
+geometry_msgs/PoseStamped start
+geometry_msgs/PoseStamped goal
+---
+bool success
+nav_msgs/Path path
+topmap_msgs/TopologyPath topology_path
+topmap_msgs/PlanStats stats
+int32 error_code
+string error_message

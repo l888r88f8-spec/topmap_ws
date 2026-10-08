@@ -1,0 +1,9 @@
+uint32 format_version
+string frame_id
+uint32 point_count
+uint32 triangle_count
+uint32 region_count
+uint32 portal_count
+uint32 connected_components
+float64 build_time_sec
+float64 memory_mb

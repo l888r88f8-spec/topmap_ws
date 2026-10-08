@@ -1,0 +1,11 @@
+int32 id
+geometry_msgs/Point centroid
+float32 area
+float32 min_z
+float32 max_z
+float32 mean_slope
+float32 max_slope
+float32 roughness
+bool is_ramp
+bool is_topology_critical
+int32[] portal_ids

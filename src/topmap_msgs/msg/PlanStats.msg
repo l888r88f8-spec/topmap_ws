@@ -1,0 +1,12 @@
+bool fallback_used
+uint32 regions_in_corridor
+uint32 triangles_in_corridor
+uint32 topology_expanded_nodes
+uint32 surface_expanded_nodes
+float64 topology_time_sec
+float64 surface_time_sec
+float64 optimization_time_sec
+float32 path_length
+float32 min_clearance
+float32 max_slope_deg
+float32 max_curvature
