@@ -34,6 +34,9 @@ const float kProjectionTolerance = PlanParams{}.max_project_radius;
 // intersection; this only absorbs float round-off and the second-order miss of a
 // centroid chord over a shallow fold.
 constexpr double kFenceTolerance = 0.05;
+// Lower bound for the uniform-grid cell size so a degenerate mesh cannot divide
+// by zero; normal meshes derive a much larger cell from their edge lengths.
+constexpr float kGridMinCell = 1e-3f;
 
 bool IsFinite(float value) { return std::isfinite(value); }
 
@@ -78,48 +81,240 @@ float TriangleDistance(const TriangleMesh& mesh, TriangleId id, const Eigen::Vec
                                mesh.vertices()[triangle.vertex_ids[2]]);
 }
 
-// Nearest triangle of any kind, true 3D distance, smallest id wins ties.
-bool NearestAnyTriangle(const TriangleMesh& mesh, const Eigen::Vector3f& p, TriangleId* located,
-                        float* distance) {
-  TriangleId best = kInvalidId;
-  float best_distance = kInf;
-  for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
-    const float d = TriangleDistance(mesh, id, p);
-    if (!IsFinite(d)) continue;
-    if (best == kInvalidId || d < best_distance) {
-      best = id;
-      best_distance = d;
-    }
-  }
-  if (best == kInvalidId) return false;
-  if (located != nullptr) *located = best;
-  if (distance != nullptr) *distance = best_distance;
-  return true;
-}
+// True 3D nearest-triangle search accelerated by an XY uniform grid that is
+// built once per public call and reused by every sample, instead of rescanning
+// the mesh per sample. The cell size is the median triangle edge length of the
+// mesh, so it is derived from the resolution rather than any scene constant.
+// Each triangle is registered in every cell its XY AABB overlaps; a query then
+// expands square rings and stops as soon as no unvisited cell can hold a closer
+// triangle. Candidates are chosen by the exact point-triangle distance with the
+// smallest TriangleId winning ties, so the result is identical to the
+// ascending-id full scan this replaces. Every triangle (not only the traversable
+// ones) is indexed, which preserves cross-layer safety: the nearest triangle of
+// any kind still decides placeability and clearance.
+class MeshGrid {
+ public:
+  bool Build(const TriangleMesh& mesh) {
+    mesh_ = &mesh;
+    cell_size_ = 0.0f;
+    origin_.setZero();
+    nx_ = 0;
+    ny_ = 0;
+    entries_.clear();
+    cell_begin_.clear();
+    if (mesh.size() == 0) return false;
 
-// Nearest robot-placeable, front-facing triangle within `tolerance`.
-bool NearestPlaceableTriangle(const TriangleMesh& mesh, const TraversabilityParams& trav,
-                              const Eigen::Vector3f& p, float tolerance, TriangleId* located,
-                              float* distance) {
-  const float back_face_tolerance = trav.max_step_height;
-  TriangleId best = kInvalidId;
-  float best_distance = kInf;
-  for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
-    const TriangleNode& triangle = mesh.triangle(id);
-    if (!TraversabilityEvaluator::isRobotPlaceable(triangle, trav)) continue;
-    if (triangle.normal.dot(p - triangle.centroid) < -back_face_tolerance) continue;
-    const float d = TriangleDistance(mesh, id, p);
-    if (!IsFinite(d) || d > tolerance) continue;
-    if (best == kInvalidId || d < best_distance) {
-      best = id;
-      best_distance = d;
+    std::vector<float> edges;
+    edges.reserve(mesh.size() * 3u);
+    float min_x = kInf, min_y = kInf;
+    float max_x = -kInf, max_y = -kInf;
+    for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
+      const TriangleNode& t = mesh.triangle(id);
+      const Eigen::Vector3f& a = mesh.vertices()[t.vertex_ids[0]];
+      const Eigen::Vector3f& b = mesh.vertices()[t.vertex_ids[1]];
+      const Eigen::Vector3f& c = mesh.vertices()[t.vertex_ids[2]];
+      edges.push_back((b - a).norm());
+      edges.push_back((c - b).norm());
+      edges.push_back((a - c).norm());
+      min_x = std::min(min_x, std::min(a.x(), std::min(b.x(), c.x())));
+      max_x = std::max(max_x, std::max(a.x(), std::max(b.x(), c.x())));
+      min_y = std::min(min_y, std::min(a.y(), std::min(b.y(), c.y())));
+      max_y = std::max(max_y, std::max(a.y(), std::max(b.y(), c.y())));
     }
+    if (edges.empty()) return false;
+    if (!IsFinite(min_x) || !IsFinite(max_x) || !IsFinite(min_y) || !IsFinite(max_y)) {
+      return false;
+    }
+
+    const std::size_t mid = edges.size() / 2u;
+    std::nth_element(edges.begin(), edges.begin() + static_cast<std::ptrdiff_t>(mid), edges.end());
+    float cell = edges[mid];
+    // Generic memory guard: cap the cell count at a small multiple of the
+    // triangle count even for meshes with one huge spatial extent.
+    const double span_x = static_cast<double>(max_x) - static_cast<double>(min_x);
+    const double span_y = static_cast<double>(max_y) - static_cast<double>(min_y);
+    const double area = span_x * span_y;
+    const double max_cells = 4.0 * static_cast<double>(mesh.size()) + 1024.0;
+    if (area > 0.0) {
+      const double min_cell = std::sqrt(area / max_cells);
+      if (min_cell > static_cast<double>(cell)) cell = static_cast<float>(min_cell);
+    }
+    if (!IsFinite(cell) || cell < kGridMinCell) cell = kGridMinCell;
+    cell_size_ = cell;
+    origin_ = Eigen::Vector2f(min_x, min_y);
+
+    nx_ = static_cast<int>(std::floor(span_x / static_cast<double>(cell_size_))) + 1;
+    ny_ = static_cast<int>(std::floor(span_y / static_cast<double>(cell_size_))) + 1;
+    if (nx_ < 1) nx_ = 1;
+    if (ny_ < 1) ny_ = 1;
+
+    struct Range {
+      int ix0 = 0, ix1 = 0, iy0 = 0, iy1 = 0;
+    };
+    std::vector<Range> ranges(mesh.size());
+    for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
+      const TriangleNode& t = mesh.triangle(id);
+      const Eigen::Vector3f& a = mesh.vertices()[t.vertex_ids[0]];
+      const Eigen::Vector3f& b = mesh.vertices()[t.vertex_ids[1]];
+      const Eigen::Vector3f& c = mesh.vertices()[t.vertex_ids[2]];
+      const float tri_min_x = std::min(a.x(), std::min(b.x(), c.x()));
+      const float tri_max_x = std::max(a.x(), std::max(b.x(), c.x()));
+      const float tri_min_y = std::min(a.y(), std::min(b.y(), c.y()));
+      const float tri_max_y = std::max(a.y(), std::max(b.y(), c.y()));
+      Range& r = ranges[static_cast<std::size_t>(id)];
+      r.ix0 = CellX(tri_min_x);
+      r.ix1 = CellX(tri_max_x);
+      r.iy0 = CellY(tri_min_y);
+      r.iy1 = CellY(tri_max_y);
+    }
+
+    const std::size_t num_cells =
+        static_cast<std::size_t>(nx_) * static_cast<std::size_t>(ny_);
+    cell_begin_.assign(num_cells + 1u, 0);
+    for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
+      const Range& r = ranges[static_cast<std::size_t>(id)];
+      for (int iy = r.iy0; iy <= r.iy1; ++iy) {
+        for (int ix = r.ix0; ix <= r.ix1; ++ix) {
+          ++cell_begin_[static_cast<std::size_t>(iy) * static_cast<std::size_t>(nx_) +
+                        static_cast<std::size_t>(ix) + 1u];
+        }
+      }
+    }
+    for (std::size_t i = 1u; i <= num_cells; ++i) cell_begin_[i] += cell_begin_[i - 1u];
+    entries_.resize(static_cast<std::size_t>(cell_begin_[num_cells]));
+    std::vector<int> cursor(cell_begin_.begin(), cell_begin_.end() - 1);
+    for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
+      const Range& r = ranges[static_cast<std::size_t>(id)];
+      for (int iy = r.iy0; iy <= r.iy1; ++iy) {
+        for (int ix = r.ix0; ix <= r.ix1; ++ix) {
+          const std::size_t c = static_cast<std::size_t>(iy) * static_cast<std::size_t>(nx_) +
+                                static_cast<std::size_t>(ix);
+          entries_[static_cast<std::size_t>(cursor[c]++)] = id;
+        }
+      }
+    }
+    return true;
   }
-  if (best == kInvalidId) return false;
-  if (located != nullptr) *located = best;
-  if (distance != nullptr) *distance = best_distance;
-  return true;
-}
+
+  bool NearestWithin(const Eigen::Vector3f& point, float tolerance, TriangleId* located,
+                     float* distance) const {
+    return NearestAccept(point, [](const TriangleMesh&, TriangleId, const Eigen::Vector3f&) {
+      return true;
+    }, tolerance, located, distance);
+  }
+
+  // Exact nearest robot-placeable, front-facing triangle within `tolerance`.
+  bool NearestPlaceable(const Eigen::Vector3f& point, const TraversabilityParams& trav,
+                        float tolerance, TriangleId* located, float* distance) const {
+    const float back_face_tolerance = trav.max_step_height;
+    return NearestAccept(
+        point,
+        [&](const TriangleMesh& mesh, TriangleId id, const Eigen::Vector3f& p) {
+          const TriangleNode& triangle = mesh.triangle(id);
+          if (!TraversabilityEvaluator::isRobotPlaceable(triangle, trav)) return false;
+          return triangle.normal.dot(p - triangle.centroid) >= -back_face_tolerance;
+        },
+        tolerance, located, distance);
+  }
+
+ private:
+  int CellX(float x) const {
+    if (!(x > -kInf)) return 0;  // NaN guard; callers validate finiteness.
+    const float cell = (x - origin_.x()) / cell_size_;
+    if (cell <= 0.0f) return 0;
+    if (cell >= static_cast<float>(nx_ - 1)) return nx_ - 1;
+    return static_cast<int>(cell);
+  }
+  int CellY(float y) const {
+    if (!(y > -kInf)) return 0;
+    const float cell = (y - origin_.y()) / cell_size_;
+    if (cell <= 0.0f) return 0;
+    if (cell >= static_cast<float>(ny_ - 1)) return ny_ - 1;
+    return static_cast<int>(cell);
+  }
+
+  // `accept` is applied only to in-range candidates and after the distance
+  // filter, exactly like the ascending-id scans it replaces. `max_distance` may
+  // be +inf for an unrestricted nearest query.
+  template <typename Accept>
+  bool NearestAccept(const Eigen::Vector3f& point, const Accept& accept, float max_distance,
+                     TriangleId* located, float* distance) const {
+    // Degenerate mesh bounds (Build failed) fall back to the exact linear scan
+    // so behaviour never depends on the grid being available.
+    if (empty()) {
+      if (mesh_ == nullptr) return false;
+      TriangleId best = kInvalidId;
+      float best_distance = kInf;
+      for (TriangleId id = 0; id < static_cast<TriangleId>(mesh_->size()); ++id) {
+        if (!accept(*mesh_, id, point)) continue;
+        const float d = TriangleDistance(*mesh_, id, point);
+        if (!IsFinite(d) || d > max_distance) continue;
+        if (best == kInvalidId || d < best_distance || (d == best_distance && id < best)) {
+          best = id;
+          best_distance = d;
+        }
+      }
+      if (best == kInvalidId) return false;
+      if (located != nullptr) *located = best;
+      if (distance != nullptr) *distance = best_distance;
+      return true;
+    }
+
+    const int cx = CellX(point.x());
+    const int cy = CellY(point.y());
+    const int max_ring = std::max(nx_, ny_);
+    TriangleId best = kInvalidId;
+    float best_distance = kInf;
+    for (int r = 0; r <= max_ring; ++r) {
+      const int x0 = std::max(0, cx - r);
+      const int x1 = std::min(nx_ - 1, cx + r);
+      const int y0 = std::max(0, cy - r);
+      const int y1 = std::min(ny_ - 1, cy + r);
+      if (x0 > x1 || y0 > y1) break;
+      for (int y = y0; y <= y1; ++y) {
+        const std::size_t row = static_cast<std::size_t>(y) * static_cast<std::size_t>(nx_);
+        for (int x = x0; x <= x1; ++x) {
+          const std::size_t c = row + static_cast<std::size_t>(x);
+          for (int k = cell_begin_[c]; k < cell_begin_[c + 1u]; ++k) {
+            const TriangleId id = entries_[static_cast<std::size_t>(k)];
+            if (!accept(*mesh_, id, point)) continue;
+            const float d = TriangleDistance(*mesh_, id, point);
+            if (!IsFinite(d) || d > max_distance) continue;
+            if (best == kInvalidId || d < best_distance || (d == best_distance && id < best)) {
+              best = id;
+              best_distance = d;
+            }
+          }
+        }
+      }
+      // After searching the square of radius r every unvisited cell is at XY
+      // distance >= r * cell_size, hence at true 3D distance at least that.
+      if (best != kInvalidId) {
+        const float bound = static_cast<float>(r) * cell_size_;
+        if (best_distance < bound || (r == 0 && best_distance <= 0.0f)) break;
+      } else if (IsFinite(max_distance) &&
+                 static_cast<float>(r) * cell_size_ > max_distance) {
+        // No closer cell can hold a candidate within the tolerance either.
+        break;
+      }
+      if (x0 == 0 && x1 == nx_ - 1 && y0 == 0 && y1 == ny_ - 1) break;
+    }
+    if (best == kInvalidId) return false;
+    if (located != nullptr) *located = best;
+    if (distance != nullptr) *distance = best_distance;
+    return true;
+  }
+
+  bool empty() const { return cell_size_ <= 0.0f || nx_ <= 0 || ny_ <= 0; }
+
+  const TriangleMesh* mesh_ = nullptr;
+  float cell_size_ = 0.0f;
+  Eigen::Vector2f origin_ = Eigen::Vector2f::Zero();
+  int nx_ = 0;
+  int ny_ = 0;
+  std::vector<TriangleId> entries_;  // CSR payload
+  std::vector<int> cell_begin_;      // CSR offsets, size nx*ny + 1
+};
 
 bool SharesTraversableEdge(const TriangleMesh& mesh, const TraversabilityParams& trav,
                            TriangleId a, TriangleId b) {
@@ -137,11 +332,11 @@ bool SharesTraversableEdge(const TriangleMesh& mesh, const TraversabilityParams&
 // Projects `point` onto a placeable triangle, resolving the shared-edge/shared-
 // vertex ambiguity against the previously located sample so a legitimate corner
 // touch is not misread as a non-traversable jump.
-bool LocatePlaceable(const TriangleMesh& mesh, const TraversabilityParams& trav,
-                     const Eigen::Vector3f& point, TriangleId previous, float tolerance,
-                     TriangleId* located) {
+bool LocatePlaceable(const MeshGrid& grid, const TriangleMesh& mesh,
+                     const TraversabilityParams& trav, const Eigen::Vector3f& point,
+                     TriangleId previous, float tolerance, TriangleId* located) {
   TriangleId nearest = kInvalidId;
-  if (!NearestPlaceableTriangle(mesh, trav, point, tolerance, &nearest, nullptr)) return false;
+  if (!grid.NearestPlaceable(point, trav, tolerance, &nearest, nullptr)) return false;
   if (previous == kInvalidId || nearest == previous ||
       SharesTraversableEdge(mesh, trav, previous, nearest)) {
     *located = nearest;
@@ -320,6 +515,11 @@ PathValidationReport SafetyValidator::validate(const std::vector<Eigen::Vector3f
   const std::vector<Sample> samples = Resample(path, check_step);
   std::vector<TriangleId> located(samples.size(), kInvalidId);
 
+  // One spatial index for the whole call; every sample reuses it instead of
+  // rescanning the mesh.
+  MeshGrid grid;
+  grid.Build(mesh);
+
   auto record = [&report](std::size_t source) { report.violating_indices.push_back(source); };
 
   report.min_clearance = kInf;
@@ -329,8 +529,7 @@ PathValidationReport SafetyValidator::validate(const std::vector<Eigen::Vector3f
     const Eigen::Vector3f& point = samples[k].point;
     TriangleId nearest = kInvalidId;
     float nearest_distance = kInf;
-    if (!NearestAnyTriangle(mesh, point, &nearest, &nearest_distance) ||
-        nearest_distance > kProjectionTolerance) {
+    if (!grid.NearestWithin(point, kProjectionTolerance, &nearest, &nearest_distance)) {
       record(samples[k].source);
       previous = kInvalidId;
       continue;
@@ -345,7 +544,7 @@ PathValidationReport SafetyValidator::validate(const std::vector<Eigen::Vector3f
     }
 
     TriangleId current = kInvalidId;
-    if (!LocatePlaceable(mesh, params, point, previous, kProjectionTolerance, &current)) {
+    if (!LocatePlaceable(grid, mesh, params, point, previous, kProjectionTolerance, &current)) {
       record(samples[k].source);
       previous = kInvalidId;
       continue;
@@ -392,12 +591,15 @@ PathValidationReport SafetyValidator::validate(const std::vector<Eigen::Vector3f
     }
   }
 
-  // Path curvature over every interior sample triple.
-  for (std::size_t k = 1; k + 1 < samples.size(); ++k) {
-    const float kappa = CurvatureAt(samples[k - 1].point, samples[k].point, samples[k + 1].point);
+  // Use the same geometric-vertex triples as PathOptimizer. Interpolated
+  // samples on each straight segment are for collision/clearance checks; using
+  // them as curvature neighbours would make the reported curvature depend on
+  // check_step and artificially amplify every polyline corner.
+  for (std::size_t k = 1; k + 1 < path.size(); ++k) {
+    const float kappa = CurvatureAt(path[k - 1], path[k], path[k + 1]);
     report.max_curvature = std::max(report.max_curvature, kappa);
     if (kappa > robot.max_path_curvature + kCurvatureEpsilon) {
-      record(samples[k].source);
+      record(k);
     }
   }
 
