@@ -23,6 +23,7 @@ add_library(topmap_surface
   src/surface_features.cpp
   src/mesh_types.cpp
   src/triangulator.cpp
+  src/traversability.cpp
 )
 target_include_directories(topmap_surface PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -64,6 +65,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_triangulator test/test_triangulator.cpp)
   if(TARGET test_triangulator)
     target_link_libraries(test_triangulator topmap_surface)
+  endif()
+  ament_add_gtest(test_traversability test/test_traversability.cpp)
+  if(TARGET test_traversability)
+    target_link_libraries(test_traversability topmap_surface)
   endif()
 endif()
 
