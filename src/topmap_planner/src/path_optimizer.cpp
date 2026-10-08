@@ -473,10 +473,28 @@ Result<std::vector<Eigen::Vector3f>> OptimizeImpl(
   }
   if (path.size() < 2u) return OptimizeFailure("shortcut produced fewer than two points");
 
+  MeshGrid grid;
+  if (!grid.Build(mesh, allowed, params.max_project_radius)) {
+    return OptimizeFailure("corridor has no triangles to index");
+  }
+  const SafetyContext ctx{&mesh, &allowed, &trav, params.check_step, params.max_project_radius,
+                          &grid};
+  const auto segments_safe = [&ctx](const std::vector<Eigen::Vector3f>& candidate) {
+    if (candidate.size() < 2u) return false;
+    for (std::size_t i = 0; i + 1 < candidate.size(); ++i) {
+      if (!SegmentSafe(ctx, candidate[i], candidate[i + 1])) return false;
+    }
+    return true;
+  };
+
   // Frozen-signature contract: without Portal geometry the funnel stage is a
-  // deterministic no-op. The overload below supplies the ordered Portals.
+  // deterministic no-op. The overload below supplies the ordered Portals. A
+  // 2D funnel can cut across a 3D slope transition even when its XY projection
+  // is valid, so accept it only when every resulting segment stays on the
+  // placeable corridor; otherwise retain the last safe shortcut path.
   if (params.funnel_enabled && ordered_portals != nullptr) {
-    path = optimizer.funnel(path, *ordered_portals);
+    std::vector<Eigen::Vector3f> funnelled = optimizer.funnel(path, *ordered_portals);
+    if (segments_safe(funnelled)) path = std::move(funnelled);
   }
   if (path.size() < 2u) return OptimizeFailure("funnel produced fewer than two points");
 
@@ -487,16 +505,8 @@ Result<std::vector<Eigen::Vector3f>> OptimizeImpl(
 
   // Internal full-path safety re-check: sampling + placeability + traversable
   // edges + curvature. Never trust the individual stages' own verdicts.
-  MeshGrid grid;
-  if (!grid.Build(mesh, allowed, params.max_project_radius)) {
-    return OptimizeFailure("corridor has no triangles to index");
-  }
-  const SafetyContext ctx{&mesh, &allowed, &trav, params.check_step, params.max_project_radius,
-                          &grid};
-  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
-    if (!SegmentSafe(ctx, path[i], path[i + 1])) {
-      return OptimizeFailure("optimized path fails the internal safety check");
-    }
+  if (!segments_safe(path)) {
+    return OptimizeFailure("optimized path fails the internal safety check");
   }
   if (MaxCurvature(path) > robot.max_path_curvature) {
     return OptimizeFailure("optimized path exceeds robot.max_path_curvature");
