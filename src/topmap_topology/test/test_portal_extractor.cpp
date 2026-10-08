@@ -27,6 +27,7 @@ using topmap::PortalParams;
 using topmap::RegionParams;
 using topmap::SurfaceRegion;
 using topmap::SyntheticScene;
+using topmap::TriangleId;
 using topmap::TriangleMesh;
 
 // R19: grow/split take a const TriangleMesh&, so the Result must be taken out
@@ -222,6 +223,78 @@ TEST(PortalExtractorTest, BrokenChainKeepsIndependentPortalsPerRegionPair) {
   EXPECT_NE(r.value()[0].boundary_chain.front(), r.value()[1].boundary_chain.front());
   EXPECT_NEAR(r.value()[0].raw_width, 0.4f, 1e-3f);
   EXPECT_NEAR(r.value()[1].raw_width, 0.4f, 1e-3f);
+}
+
+// The shared-edge graph of a Region pair is not always a simple path: a
+// checkerboard assignment of two Regions makes every interior interface vertex
+// degree 4. The extractor must decompose such a graph into simple chains whose
+// consecutive vertices are real shared edges of that pair and whose per-chain
+// vertex degree never exceeds 2 - a backtracking walk that dumps every branch
+// tip into one vertex list would place non-adjacent tips next to each other.
+TEST(PortalExtractorTest, BranchingInterfaceIsSplitIntoValidPaths) {
+  Grid g = MakeGrid(6, 6, 0.1f);
+  SurfaceRegion a;
+  a.id = 0;
+  SurfaceRegion b;
+  b.id = 1;
+  for (int j = 0; j < 6; ++j) {
+    for (int i = 0; i < 6; ++i) {
+      const int t = CellTri0(g, i, j);
+      SurfaceRegion& owner = ((i + j) % 2 == 0) ? a : b;
+      owner.triangle_ids.push_back(t);
+      owner.triangle_ids.push_back(t + 1);
+    }
+  }
+
+  // Shared edges of the (0, 1) interface, collected independently.
+  std::set<std::pair<PointId, PointId>> shared;
+  for (TriangleId t = 0; t < static_cast<TriangleId>(g.mesh.size()); ++t) {
+    for (const topmap::TriangleEdge& e : g.mesh.triangle(t).edges) {
+      const TriangleId u = e.neighbor;
+      if (u == topmap::kInvalidId || u < t) continue;
+      const bool t_in_a = std::find(a.triangle_ids.begin(), a.triangle_ids.end(), t) != a.triangle_ids.end();
+      const bool t_in_b = std::find(b.triangle_ids.begin(), b.triangle_ids.end(), t) != b.triangle_ids.end();
+      const bool u_in_a = std::find(a.triangle_ids.begin(), a.triangle_ids.end(), u) != a.triangle_ids.end();
+      const bool u_in_b = std::find(b.triangle_ids.begin(), b.triangle_ids.end(), u) != b.triangle_ids.end();
+      if ((t_in_a && u_in_b) || (t_in_b && u_in_a)) {
+        shared.insert({std::min(e.v0, e.v1), std::max(e.v0, e.v1)});
+      }
+    }
+  }
+  ASSERT_FALSE(shared.empty());
+
+  auto r = PortalExtractor().extract(g.mesh, {a, b}, PortalParams{});
+  ASSERT_TRUE(r.ok()) << r.status().message;
+  ASSERT_GT(r.value().size(), 0u);
+
+  for (const Portal& portal : r.value()) {
+    ASSERT_GE(portal.boundary_chain.size(), 2u);
+    std::map<PointId, int> degree;
+    float arc_length = 0.0f;
+    for (std::size_t k = 1; k < portal.boundary_chain.size(); ++k) {
+      const PointId from = portal.boundary_chain[k - 1];
+      const PointId to = portal.boundary_chain[k];
+      // Adjacent chain vertices must be connected by an actual shared mesh edge.
+      EXPECT_EQ(shared.count({std::min(from, to), std::max(from, to)}), 1u)
+          << "consecutive chain vertices " << from << " and " << to << " are not a shared edge";
+      ++degree[from];
+      ++degree[to];
+      arc_length += (g.mesh.vertices()[to] - g.mesh.vertices()[from]).norm();
+    }
+    for (const auto& entry : degree) {
+      EXPECT_LE(entry.second, 2) << "chain vertex " << entry.first << " has degree > 2";
+    }
+    EXPECT_NEAR(portal.raw_width, arc_length, 1e-3f);
+  }
+
+  // A second extraction over the same graph must be byte-for-byte reproducible.
+  auto again = PortalExtractor().extract(g.mesh, {a, b}, PortalParams{});
+  ASSERT_TRUE(again.ok()) << again.status().message;
+  ASSERT_EQ(again.value().size(), r.value().size());
+  for (std::size_t i = 0; i < r.value().size(); ++i) {
+    EXPECT_EQ(r.value()[i].boundary_chain, again.value()[i].boundary_chain);
+    EXPECT_FLOAT_EQ(r.value()[i].raw_width, again.value()[i].raw_width);
+  }
 }
 
 TEST(PortalExtractorTest, ShortChainsAreFilteredByBoundaryMinEdges) {

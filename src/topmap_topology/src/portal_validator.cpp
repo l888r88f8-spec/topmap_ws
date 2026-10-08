@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <set>
 #include <string>
 #include <utility>
@@ -114,9 +115,21 @@ Result<PortalValidationReport> PortalValidator::validateDetailed(
     }
 
     // The crossing is the set of mesh edges between the two Regions whose
-    // endpoints belong to this chain. valid_width is the widest such crossing,
-    // recomputed from the mesh clearance field rather than carried over from the
-    // raw chain length.
+    // endpoints belong to this chain. valid_width is sampled along the chain
+    // from the region-union boundary-distance field (R8's
+    // regionBoundaryDistance, never TriangleNode.min_clearance): for each
+    // crossing edge the free distance on the two sides of the chain normal is
+    // 2 * regionBoundaryDistance(seed), and the narrowest sample over the whole
+    // chain is the portal width.
+    std::vector<TriangleId> region_union;
+    for (const SurfaceRegion& region : regions) {
+      if (region.id != candidate.region_a && region.id != candidate.region_b) continue;
+      region_union.insert(region_union.end(), region.triangle_ids.begin(),
+                          region.triangle_ids.end());
+    }
+    const std::vector<float> free_distance = regionBoundaryDistance(mesh, region_union);
+
+    float valid_width = std::numeric_limits<float>::infinity();
     float best_clearance = -1.0f;
     float max_step = 0.0f;
     std::set<TriangleId> touched;
@@ -127,6 +140,11 @@ Result<PortalValidationReport> PortalValidator::validateDetailed(
         if (u == kInvalidId || triangle_region[u] != candidate.region_b) continue;
         if (e.v0 == kInvalidId || e.v1 == kInvalidId) continue;
         if (chain_edges.count(edgeKey(e.v0, e.v1)) == 0) continue;
+        const float side_a = 2.0f * free_distance[static_cast<std::size_t>(t)];
+        const float side_b = 2.0f * free_distance[static_cast<std::size_t>(u)];
+        valid_width = std::min(valid_width, std::min(side_a, side_b));
+        // min_clearance stays the R8 footprint-erosion yardstick; it is never
+        // mixed with the region-union width field.
         const float capacity =
             std::min(mesh.triangle(t).min_clearance, mesh.triangle(u).min_clearance);
         best_clearance = std::max(best_clearance, capacity);
@@ -137,7 +155,7 @@ Result<PortalValidationReport> PortalValidator::validateDetailed(
       }
     }
 
-    if (best_clearance < 0.0f) {
+    if (best_clearance < 0.0f || !std::isfinite(valid_width)) {
       report.rejections.push_back(PortalRejection{
           candidate.id, PortalRejectionReason::kInvalidChain, ErrorCode::kPortalValidationFailed,
           "boundary chain does not match any shared edge between the two regions"});
@@ -145,7 +163,7 @@ Result<PortalValidationReport> PortalValidator::validateDetailed(
     }
 
     Portal portal = candidate;
-    portal.valid_width = 2.0f * best_clearance;
+    portal.valid_width = valid_width;
     portal.min_clearance = best_clearance;
     portal.max_step = max_step;
     portal.mean_slope = weightedMeanSlope(mesh, touched);

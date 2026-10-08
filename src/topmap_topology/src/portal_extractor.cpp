@@ -19,112 +19,86 @@ struct RawEdge {
   PointId b = kInvalidId;
 };
 
-// One endpoint-connected Boundary Chain. `verts` is a deterministic traversal
-// order of the component's vertices and `edges` holds each shared edge exactly
-// once, so `raw_width` never double counts a pinch that two sub-branches share.
+// One Boundary Chain, emitted as an ordered vertex sequence. Consecutive
+// vertices are always joined by one of the input shared edges, so
+// polylineLength(verts) is exactly the shared boundary length and no two
+// non-adjacent branch tips are ever placed next to each other.
 struct Chain {
   std::vector<PointId> verts;
-  std::vector<RawEdge> edges;
   bool closed = false;
 };
 
-// Chains are the connected components of the shared-edge graph under "shares an
-// endpoint". This keeps a pinched opening as a single portal (R15: kLoop = 8)
-// while still keeping genuinely disjoint passages of the same Region pair as
-// separate portals.
+// Deterministic path decomposition of the shared-edge graph. The plan requires
+// each chain vertex to have degree <= 2: when the interface branches (a vertex
+// with three or more shared edges) the walk consumes incident edges in
+// ascending (neighbour id, edge index) order from each growing end, so the two
+// smallest-id branches form the through-path and the leftover edges seed new
+// chains. This is scene-independent and reproducible.
 std::vector<Chain> buildChains(const std::vector<RawEdge>& edges) {
   const int edge_total = static_cast<int>(edges.size());
-  std::vector<int> parent(static_cast<std::size_t>(edge_total));
-  std::iota(parent.begin(), parent.end(), 0);
-  const auto find = [&parent](int x) {
-    while (parent[x] != x) {
-      parent[x] = parent[parent[x]];
-      x = parent[x];
-    }
-    return x;
-  };
-  const auto unite = [&find, &parent](int a, int b) {
-    a = find(a);
-    b = find(b);
-    if (a != b) parent[a] = b;
-  };
-
-  std::map<PointId, int> first_edge_at;
+  std::map<PointId, std::vector<std::pair<PointId, int>>> incident;
   for (int i = 0; i < edge_total; ++i) {
-    for (PointId v : {edges[i].a, edges[i].b}) {
-      const auto it = first_edge_at.find(v);
-      if (it == first_edge_at.end()) {
-        first_edge_at.emplace(v, i);
-      } else {
-        unite(i, it->second);
-      }
-    }
+    incident[edges[i].a].emplace_back(edges[i].b, i);
+    incident[edges[i].b].emplace_back(edges[i].a, i);
+  }
+  for (auto& entry : incident) {
+    std::sort(entry.second.begin(), entry.second.end());
   }
 
-  std::map<int, std::vector<int>> groups;
-  for (int i = 0; i < edge_total; ++i) groups[find(i)].push_back(i);
+  // Global edge order: (smaller endpoint, larger endpoint, edge index).
+  std::vector<int> order(static_cast<std::size_t>(edge_total));
+  std::iota(order.begin(), order.end(), 0);
+  std::sort(order.begin(), order.end(), [&edges](int i, int j) {
+    const auto key = [&edges](int e) {
+      return std::make_tuple(std::min(edges[e].a, edges[e].b), std::max(edges[e].a, edges[e].b), e);
+    };
+    return key(i) < key(j);
+  });
 
+  std::vector<char> used(static_cast<std::size_t>(edge_total), 0);
   std::vector<Chain> chains;
-  chains.reserve(groups.size());
-  for (const auto& group : groups) {
-    std::map<PointId, std::vector<int>> incident;
-    for (int i : group.second) {
-      incident[edges[i].a].push_back(i);
-      incident[edges[i].b].push_back(i);
-    }
-
-    // Prefer a degree-1 endpoint as the traversal seed so a simple path is
-    // emitted end to end; a pure ring has none and starts at the smallest id.
-    PointId start = incident.begin()->first;
-    bool has_open_end = false;
-    for (const auto& entry : incident) {
-      if (entry.second.size() == 1u) {
-        start = entry.first;
-        has_open_end = true;
-        break;
-      }
-    }
-    if (!has_open_end) {
-      for (const auto& entry : incident) {
-        start = std::min(start, entry.first);
-      }
-    }
-
-    bool closed = true;
-    for (const auto& entry : incident) {
-      if (entry.second.size() != 2u) {
-        closed = false;
-        break;
-      }
-    }
-
-    std::vector<char> used(static_cast<std::size_t>(edge_total), 0);
+  for (int seed : order) {
+    if (used[seed]) continue;
+    used[seed] = 1;
     Chain chain;
-    chain.verts.push_back(start);
-    for (int i : group.second) chain.edges.push_back(edges[i]);
-    chain.closed = closed;
+    chain.verts = {edges[seed].a, edges[seed].b};
 
-    std::vector<PointId> stack{start};
-    while (!stack.empty()) {
-      const PointId v = stack.back();
-      int best_edge = -1;
-      PointId best_other = kInvalidId;
-      for (int i : incident[v]) {
-        if (used[i]) continue;
-        const PointId other = (edges[i].a == v) ? edges[i].b : edges[i].a;
-        if (best_edge < 0 || other < best_other || (other == best_other && i < best_edge)) {
-          best_edge = i;
-          best_other = other;
+    const auto already_on_path = [&chain](PointId v) {
+      return std::find(chain.verts.begin(), chain.verts.end(), v) != chain.verts.end();
+    };
+    const auto extend = [&](bool front) {
+      while (true) {
+        const PointId end = front ? chain.verts.front() : chain.verts.back();
+        const PointId other = front ? chain.verts.back() : chain.verts.front();
+        int pick = -1;
+        PointId pick_neighbour = kInvalidId;
+        for (const auto& candidate : incident[end]) {
+          const PointId neighbour = candidate.first;
+          const int edge_id = candidate.second;
+          if (used[edge_id]) continue;
+          // Only the opposite chain end may repeat, and only to close a ring.
+          if (neighbour != other && already_on_path(neighbour)) continue;
+          if (pick < 0 || neighbour < pick_neighbour ||
+              (neighbour == pick_neighbour && edge_id < pick)) {
+            pick = edge_id;
+            pick_neighbour = neighbour;
+          }
+        }
+        if (pick < 0) break;
+        used[pick] = 1;
+        if (front) {
+          chain.verts.insert(chain.verts.begin(), pick_neighbour);
+        } else {
+          chain.verts.push_back(pick_neighbour);
+        }
+        if (pick_neighbour == other) {
+          chain.closed = true;
+          break;
         }
       }
-      if (best_edge < 0) {
-        stack.pop_back();
-        continue;
-      }
-      used[best_edge] = 1;
-      chain.verts.push_back(best_other);
-      stack.push_back(best_other);
-    }
+    };
+    extend(false);
+    extend(true);
     chains.push_back(std::move(chain));
   }
   return chains;
@@ -199,10 +173,13 @@ Result<std::vector<Portal>> PortalExtractor::extract(
   std::vector<Portal> portals;
   for (const auto& entry : by_pair) {
     for (Chain& chain : buildChains(entry.second)) {
-      if (static_cast<int>(chain.edges.size()) < params.boundary_min_edges) continue;
+      const int edge_count = static_cast<int>(chain.verts.size()) - 1;
+      if (edge_count < params.boundary_min_edges) continue;
+      // raw_width is the polyline length of the ordered chain - the boundary
+      // geometry only. T16 recomputes the traversal width from the mesh.
       float length = 0.0f;
-      for (const RawEdge& e : chain.edges) {
-        length += (mesh.vertices()[e.b] - mesh.vertices()[e.a]).norm();
+      for (std::size_t k = 1; k < chain.verts.size(); ++k) {
+        length += (mesh.vertices()[chain.verts[k]] - mesh.vertices()[chain.verts[k - 1]]).norm();
       }
       Portal portal;
       portal.region_a = entry.first.first;
