@@ -1,0 +1,60 @@
+topmap:
+  robot:
+    width: -1.0
+    length: 0.80
+    max_slope_deg: 20.0
+    max_step_height: 0.05
+    safety_distance: 0.15
+    max_path_curvature: 0.25
+  map:
+    voxel_size: 0.10
+    outlier_k: 20
+    outlier_std_ratio: 1.0
+    normal_search_radius: 0.30
+    max_edge_length: 0.30
+    max_normal_deviation_deg: 35.0
+    prefer_layered_triangulation: false
+    keep_raw_cloud: true
+  traversability:
+    max_normal_diff_deg: 30.0
+    max_slope_diff_deg: 15.0
+    allow_slope_transition: true
+    max_roughness: 0.03
+    max_surface_curvature: 0.05
+    min_triangle_area: 0.0025
+  region:
+    normal_weight: 1.0
+    slope_weight: 0.5
+    roughness_weight: 0.5
+    height_weight: 1.0
+    region_score_threshold: 0.60
+    max_height_span: 0.30
+    slope_regime_deg: 8.0
+    height_span_across_regime_only: true
+    max_slope_variance: 0.02
+    min_region_area: 0.50
+    min_region_triangles: 20
+    bottleneck_ratio: 0.50
+    bottleneck_abs_ceiling: 2.00
+    min_side_area: 0.50
+    concavity_branch_min_arm_length: 1.00
+    concavity_branch_angle_deg: 60.0
+    ramp_slope_deg: 8.0
+  portal:
+    boundary_min_edges: 2
+    width_margin: 0.0
+  compression:
+    max_merge_cost: 0.25
+    preserve_topology: true
+    forbid_cross_regime_merge: true
+  plan:
+    max_project_radius: 0.30
+    max_project_normal_diff_deg: 45.0
+    corridor_expansion_rings: 1
+    fallback_full_mesh: true
+    shortcut_enabled: true
+    funnel_enabled: true
+    smoothing_enabled: true
+    smoothing_iterations: 20
+    check_step: 0.05
+    topology_weight: 1.0
