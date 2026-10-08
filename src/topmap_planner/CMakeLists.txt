@@ -26,6 +26,7 @@ add_library(topmap_planner
   src/path_optimizer.cpp
   src/safety_validator.cpp
   src/hierarchical_planner.cpp
+  src/benchmark_runner.cpp
 )
 target_include_directories(topmap_planner PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -47,6 +48,13 @@ install(
   RUNTIME DESTINATION bin
 )
 install(DIRECTORY include/ DESTINATION include)
+
+# R30: benchmark_runner is a plain add_executable (ament_add_executable does not
+# exist); it is installed under lib/${PROJECT_NAME} so `ros2 run topmap_planner
+# benchmark_runner` resolves it.
+add_executable(benchmark_runner src/benchmark_main.cpp)
+target_link_libraries(benchmark_runner ${PROJECT_NAME})
+install(TARGETS benchmark_runner DESTINATION lib/${PROJECT_NAME})
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(ament_cmake topmap_core topmap_surface topmap_topology Eigen3)
@@ -83,6 +91,23 @@ if(BUILD_TESTING)
     # Several cases run the complete Debug-build pipeline (including path
     # optimization and resampled safety validation) more than once.
     set_tests_properties(test_hierarchical_planner PROPERTIES TIMEOUT 300)
+  endif()
+  ament_add_gtest(test_benchmark_runner test/test_benchmark_runner.cpp)
+  if(TARGET test_benchmark_runner)
+    target_link_libraries(test_benchmark_runner topmap_planner)
+
+    # Basic CLI contract, exercised without a config file: --help must succeed,
+    # an unknown scene name must fail before any configuration is loaded, and a
+    # non-positive point radius must be rejected.
+    add_test(NAME benchmark_runner_help COMMAND benchmark_runner --help)
+    add_test(NAME benchmark_runner_rejects_unknown_scene
+             COMMAND benchmark_runner --scenes no_such_scene)
+    set_tests_properties(benchmark_runner_rejects_unknown_scene
+                         PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME benchmark_runner_rejects_bad_radius
+             COMMAND benchmark_runner --scenes flat_plane --point-radius 0)
+    set_tests_properties(benchmark_runner_rejects_bad_radius
+                         PROPERTIES WILL_FAIL TRUE)
   endif()
 endif()
 
