@@ -14,8 +14,20 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(ament_cmake REQUIRED)
 
+add_library(topmap_core
+  src/error.cpp
+)
+target_include_directories(topmap_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_features(topmap_core PUBLIC cxx_std_17)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_error test/test_error.cpp)
+  if(TARGET test_error)
+    target_link_libraries(test_error topmap_core)
+  endif()
 endif()
 
 ament_package()
