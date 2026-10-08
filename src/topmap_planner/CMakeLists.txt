@@ -25,6 +25,7 @@ add_library(topmap_planner
   src/surface_astar.cpp
   src/path_optimizer.cpp
   src/safety_validator.cpp
+  src/hierarchical_planner.cpp
 )
 target_include_directories(topmap_planner PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -75,10 +76,13 @@ if(BUILD_TESTING)
   ament_add_gtest(test_safety_validator test/test_safety_validator.cpp)
   if(TARGET test_safety_validator)
     target_link_libraries(test_safety_validator topmap_planner)
-    # This suite builds several full synthetic maps and intentionally resamples
-    # a long off-surface segment; it exceeds ament's 60 s default on Debug ARM
-    # builds even though every individual case completes promptly.
-    set_tests_properties(test_safety_validator PROPERTIES TIMEOUT 180)
+  endif()
+  ament_add_gtest(test_hierarchical_planner test/test_hierarchical_planner.cpp)
+  if(TARGET test_hierarchical_planner)
+    target_link_libraries(test_hierarchical_planner topmap_planner)
+    # Several cases run the complete Debug-build pipeline (including path
+    # optimization and resampled safety validation) more than once.
+    set_tests_properties(test_hierarchical_planner PROPERTIES TIMEOUT 300)
   endif()
 endif()
 
