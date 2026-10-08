@@ -153,10 +153,13 @@ bool BinaryReader::readString(std::string& v) {
 
 bool BinaryReader::readVector3f(Eigen::Vector3f& v) {
   const std::size_t start = offset_;
-  if (!readF32(v.x()) || !readF32(v.y()) || !readF32(v.z())) {
+  // Read into a temporary so a partial read leaves the caller's object intact.
+  Eigen::Vector3f tmp = Eigen::Vector3f::Zero();
+  if (!readF32(tmp.x()) || !readF32(tmp.y()) || !readF32(tmp.z())) {
     offset_ = start;
     return false;
   }
+  v = tmp;
   return true;
 }
 

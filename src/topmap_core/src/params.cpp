@@ -35,13 +35,27 @@ Result<bool> reqBool(const YAML::Node& n, const std::string& path) {
   }
 }
 
+// A topmap section must be a mapping; a scalar/sequence node would make the
+// later operator[] calls throw YAML::BadSubscript instead of returning a
+// structured error naming the offending path.
+Status requireMap(const YAML::Node& n, const std::string& path) {
+  if (!n) return Status::Error(ErrorCode::kInvalidArgument, "missing key " + path);
+  if (!n.IsMap()) return Status::Error(ErrorCode::kInvalidArgument, path + ": expected mapping");
+  return Status::Ok();
+}
+
 // R1: reject unknown keys (including removed derived keys) so a stale config
 // cannot silently appear to take effect.
 Status rejectUnknown(const YAML::Node& section, const std::string& prefix,
                      const std::set<std::string>& allowed) {
   if (!section || !section.IsMap()) return Status::Ok();
   for (const auto& kv : section) {
-    const std::string key = kv.first.as<std::string>();
+    std::string key;
+    try {
+      key = kv.first.as<std::string>();
+    } catch (const YAML::Exception& e) {
+      return Status::Error(ErrorCode::kInvalidArgument, prefix + ": " + e.what());
+    }
     if (allowed.find(key) == allowed.end())
       return Status::Error(ErrorCode::kInvalidArgument, "unknown key " + prefix + "." + key);
   }
@@ -61,19 +75,23 @@ float TraversabilityParams::max_slope_rad() const { return max_slope_deg * kPi /
 float TraversabilityParams::max_normal_diff_rad() const { return max_normal_diff_deg * kPi / 180.0f; }
 float TraversabilityParams::max_slope_diff_rad() const { return max_slope_diff_deg * kPi / 180.0f; }
 
-Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
+namespace {
+Result<TopmapConfig> loadTopmapConfigImpl(const std::string& path) {
   YAML::Node root;
   try {
     root = YAML::LoadFile(path);
   } catch (const YAML::Exception& e) {
     return Status::Error(ErrorCode::kInvalidArgument, e.what());
   }
+  if (!root.IsMap())
+    return Status::Error(ErrorCode::kInvalidArgument, "topmap: expected mapping");
   YAML::Node t = root["topmap"];
-  if (!t) return Status::Error(ErrorCode::kInvalidArgument, "missing key topmap");
+  if (auto s = requireMap(t, "topmap"); !s.ok()) return s;
   TopmapConfig c;
   YAML::Node n;
 
   n = t["robot"];
+  if (auto s = requireMap(n, "topmap.robot"); !s.ok()) return s;
   if (auto s = rejectUnknown(n, "topmap.robot",
       {"width", "length", "max_slope_deg", "max_step_height", "safety_distance",
        "max_path_curvature"}); !s.ok()) return s;
@@ -85,6 +103,7 @@ Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
   REQ(c.robot.max_path_curvature, n, "max_path_curvature", "topmap.robot");
 
   n = t["map"];
+  if (auto s = requireMap(n, "topmap.map"); !s.ok()) return s;
   if (auto s = rejectUnknown(n, "topmap.map",
       {"voxel_size", "outlier_k", "outlier_std_ratio", "normal_search_radius", "max_edge_length",
        "max_normal_deviation_deg", "prefer_layered_triangulation", "keep_raw_cloud"}); !s.ok()) return s;
@@ -98,6 +117,7 @@ Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
   REQ_B(c.map.keep_raw_cloud, n, "keep_raw_cloud", "topmap.map");
 
   n = t["traversability"];
+  if (auto s = requireMap(n, "topmap.traversability"); !s.ok()) return s;
   if (auto s = rejectUnknown(n, "topmap.traversability",
       {"max_normal_diff_deg", "max_slope_diff_deg", "allow_slope_transition", "max_roughness",
        "max_surface_curvature", "min_triangle_area"}); !s.ok()) return s;
@@ -109,6 +129,7 @@ Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
   REQ(c.traversability.min_triangle_area, n, "min_triangle_area", "topmap.traversability");
 
   n = t["region"];
+  if (auto s = requireMap(n, "topmap.region"); !s.ok()) return s;
   if (auto s = rejectUnknown(n, "topmap.region",
       {"normal_weight", "slope_weight", "roughness_weight", "height_weight", "region_score_threshold",
        "max_height_span", "slope_regime_deg", "height_span_across_regime_only", "max_slope_variance",
@@ -134,12 +155,14 @@ Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
   REQ(c.region.ramp_slope_deg, n, "ramp_slope_deg", "topmap.region");
 
   n = t["portal"];
+  if (auto s = requireMap(n, "topmap.portal"); !s.ok()) return s;
   if (auto s = rejectUnknown(n, "topmap.portal",
       {"boundary_min_edges", "width_margin"}); !s.ok()) return s;
   REQ_I(c.portal.boundary_min_edges, n, "boundary_min_edges", "topmap.portal");
   REQ(c.portal.width_margin, n, "width_margin", "topmap.portal");
 
   n = t["compression"];
+  if (auto s = requireMap(n, "topmap.compression"); !s.ok()) return s;
   if (auto s = rejectUnknown(n, "topmap.compression",
       {"max_merge_cost", "preserve_topology", "forbid_cross_regime_merge"}); !s.ok()) return s;
   REQ(c.compression.max_merge_cost, n, "max_merge_cost", "topmap.compression");
@@ -147,6 +170,7 @@ Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
   REQ_B(c.compression.forbid_cross_regime_merge, n, "forbid_cross_regime_merge", "topmap.compression");
 
   n = t["plan"];
+  if (auto s = requireMap(n, "topmap.plan"); !s.ok()) return s;
   if (auto s = rejectUnknown(n, "topmap.plan",
       {"max_project_radius", "max_project_normal_diff_deg", "corridor_expansion_rings",
        "fallback_full_mesh", "shortcut_enabled", "funnel_enabled", "smoothing_enabled",
@@ -182,6 +206,16 @@ Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
   if (c.plan.check_step <= 0.0f)
     return Status::Error(ErrorCode::kInvalidArgument, "topmap.plan.check_step must be positive");
   return c;
+}
+}  // namespace
+
+Result<TopmapConfig> loadTopmapConfig(const std::string& path) {
+  // Final boundary: no YAML::Exception may escape into the caller.
+  try {
+    return loadTopmapConfigImpl(path);
+  } catch (const YAML::Exception& e) {
+    return Status::Error(ErrorCode::kInvalidArgument, e.what());
+  }
 }
 
 Result<RobotParams> loadRobotParams(const std::string& path) {

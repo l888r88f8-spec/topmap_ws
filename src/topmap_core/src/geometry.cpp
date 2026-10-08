@@ -10,6 +10,10 @@ namespace topmap {
 
 float clampf(float v, float lo, float hi) { return std::max(lo, std::min(v, hi)); }
 
+// The frozen plan defines no direction for a zero vector. clampf keeps the acos
+// argument inside [-1, 1], so a degenerate input still yields a finite result
+// rather than NaN; the exact angle is intentionally left unspecified (see
+// GeometryTest.AngleHelpersAreFiniteForZeroVectors).
 float angleBetween(const Eigen::Vector3f& a, const Eigen::Vector3f& b) {
   return std::acos(clampf(a.normalized().dot(b.normalized()), -1.0f, 1.0f));
 }
@@ -51,7 +55,11 @@ float pointTriangleDistance(const Eigen::Vector3f& p, const Eigen::Vector3f& a,
                             const Eigen::Vector3f& b, const Eigen::Vector3f& c) {
   const Eigen::Vector3f ab = b - a, ac = c - a, n = ab.cross(ac);
   const float area2 = n.squaredNorm();
-  if (area2 <= 1e-12f) return std::min({(p - a).norm(), (p - b).norm(), (p - c).norm()});
+  // Degenerate (collinear or coincident) triangle: the closest point lies on
+  // one of the three segments, so fall back to the minimum edge distance.
+  if (area2 <= 1e-12f)
+    return std::min({segmentDistance(p, a, b), segmentDistance(p, b, c),
+                     segmentDistance(p, c, a)});
   const Eigen::Vector3f nn = n / std::sqrt(area2);
   const float d = nn.dot(p - a);
   const Eigen::Vector3f proj = p - d * nn;
