@@ -20,6 +20,7 @@ add_library(topmap_core
   src/error.cpp
   src/params.cpp
   src/binary_io.cpp
+  src/geometry.cpp
 )
 target_include_directories(topmap_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -42,6 +43,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_binary_io test/test_binary_io.cpp)
   if(TARGET test_binary_io)
     target_link_libraries(test_binary_io topmap_core)
+  endif()
+  ament_add_gtest(test_geometry test/test_geometry.cpp)
+  if(TARGET test_geometry)
+    target_link_libraries(test_geometry topmap_core)
   endif()
 endif()
 
