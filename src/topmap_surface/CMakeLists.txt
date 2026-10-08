@@ -20,6 +20,7 @@ find_package(PCL REQUIRED COMPONENTS common io filters features search kdtree)
 add_library(topmap_surface
   src/point_cloud_processor.cpp
   src/surface_features.cpp
+  src/mesh_types.cpp
 )
 target_include_directories(topmap_surface PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -52,6 +53,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_surface_features test/test_surface_features.cpp)
   if(TARGET test_surface_features)
     target_link_libraries(test_surface_features topmap_surface)
+  endif()
+  ament_add_gtest(test_triangle_mesh test/test_triangle_mesh.cpp)
+  if(TARGET test_triangle_mesh)
+    target_link_libraries(test_triangle_mesh topmap_surface)
   endif()
 endif()
 
