@@ -12,7 +12,10 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>rviz2</exec_depend>
+  <exec_depend>topmap_msgs</exec_depend>
   <exec_depend>topmap_ros</exec_depend>
+  <!-- run_acceptance.sh invokes the installed write_synthetic_pcd tool directly. -->
+  <exec_depend>topmap_surface</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

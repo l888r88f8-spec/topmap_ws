@@ -111,6 +111,18 @@ if(BUILD_TESTING)
       # planner (Debug build) end to end.
       TIMEOUT 300)
   endif()
+  # T32: the ROS build -> plan closed loop. It runs the full Hall map build and
+  # the hierarchical planner through the two services, so it gets the same
+  # generous Debug-build budget as the node tests and its own log directory.
+  ament_add_gtest(test_end_to_end test/test_end_to_end.cpp)
+  if(TARGET test_end_to_end)
+    target_link_libraries(test_end_to_end topmap_ros)
+    target_compile_definitions(test_end_to_end PRIVATE
+      TOPMAP_ROS_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    set_tests_properties(test_end_to_end PROPERTIES
+      ENVIRONMENT "ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_ros_logs"
+      TIMEOUT 300)
+  endif()
 endif()
 
 ament_package()
