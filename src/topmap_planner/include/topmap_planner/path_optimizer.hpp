@@ -72,6 +72,28 @@ class PathOptimizer {
                                       const TriangleMesh& mesh, const PlanParams& params,
                                       const RobotParams& robot,
                                       const TraversabilityParams& trav) const;
+
+  // T34: deterministic circular corner filleting. Each interior corner whose
+  // discrete curvature exceeds robot.max_path_curvature is replaced by an arc in
+  // the plane of its incident segments. The radius is
+  // (1 + kFilletRadiusMargin) / robot.max_path_curvature, i.e. never below the
+  // curvature limit, so the sampled arc's own discrete curvature is within the
+  // limit. For turn angle phi the tangent distance is R * tan(phi / 2) and both
+  // tangent points lie on the incident segments. Arc samples are spaced so the
+  // chord is <= plan.check_step, capped at kFilletMaxPoints output points.
+  //
+  // Collinear corners are left untouched; a U-turn or a corner whose tangent
+  // distance does not fit the incident segments (including neighbouring fillets
+  // on the same segment) is left unfilleted rather than rounded with a radius
+  // below the limit. A candidate arc is rejected when any straight or arc
+  // segment leaves the placeable corridor, crosses a non-traversable edge or
+  // changes component. Endpoints are preserved and duplicate/degenerate points
+  // are never emitted. A `const` pure function: invalid parameters/input make it
+  // return the input unchanged (or only the collapsed duplicates).
+  std::vector<Eigen::Vector3f> fillet(const std::vector<Eigen::Vector3f>& pts,
+                                      const TriangleMesh& mesh, const Corridor& corridor,
+                                      const PlanParams& params, const RobotParams& robot,
+                                      const TraversabilityParams& trav) const;
 };
 
 }  // namespace topmap

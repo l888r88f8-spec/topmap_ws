@@ -6,6 +6,7 @@
 #include "topmap_core/error.hpp"
 #include "topmap_core/params.hpp"
 #include "topmap_surface/synthetic_scene.hpp"
+#include "topmap_topology/topology_graph.hpp"
 
 namespace topmap {
 
@@ -52,5 +53,13 @@ Result<std::vector<BenchmarkRecord>> readBenchmarkCsv(const std::string& path);
 Result<std::vector<BenchmarkRecord>> runBenchmark(const std::vector<SyntheticScene>& scenes,
                                                   const std::vector<PlanningMethod>& methods,
                                                   const TopmapConfig& config, float point_radius);
+
+// A-01: counts Portals whose two Regions have disjoint height bands *and* whose
+// own interface step exceeds `trav.max_step_height`. Disjoint Region bands alone
+// are not a violation: a continuous ramp-to-flat transition has a ramp Region
+// spanning the whole rise while the flat Regions sit at its ends, yet the shared
+// edge step is below the robot limit. Only a genuinely discontinuous
+// cross-floor join (large step) is counted.
+int CountInvalidCrossLayerEdges(const TopologyGraph& graph, const TraversabilityParams& trav);
 
 }  // namespace topmap

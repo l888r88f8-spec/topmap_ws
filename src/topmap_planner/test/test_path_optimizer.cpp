@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 
 #include "test_support_plan.hpp"
 #include "topmap_core/geometry.hpp"
@@ -474,4 +475,133 @@ TEST(PathOptimizerTest, OverloadRunsShortcutFunnelSmoothInOrder) {
   for (std::size_t i = 0; i < result.value().size(); ++i) {
     EXPECT_TRUE(again.value()[i].isApprox(result.value()[i]));
   }
+}
+
+// T34: a 90-degree corner whose incident segments are long enough to hold the
+// tangent distance R * tan(45) = 1 / max_path_curvature * 1.05 = 4.2 m is
+// replaced by a safe circular arc. On this flat 6x6 scene the incoming segment
+// leaves 0.6 m of straight, the outgoing segment is exactly the tangent length,
+// and the arc (radius 4.2, clearance >= 0.6 m) stays well inside the surface.
+TEST(PathOptimizerTest, FilletRoundsFeasibleNinetyDegreeTurn) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kFlatPlane);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  const PlanParams params;
+  const std::vector<Eigen::Vector3f> raw = {{0.6f, 0.6f, kFlatZ},
+                                            {0.6f, 5.4f, kFlatZ},
+                                            {4.8f, 5.4f, kFlatZ}};
+  ASSERT_GT(MaxCurvature(raw), robot.max_path_curvature);
+
+  const auto out = PathOptimizer().fillet(raw, mesh, corridor, params, robot, trav);
+  EXPECT_GT(out.size(), raw.size());
+  ASSERT_GE(out.size(), 2u);
+  EXPECT_TRUE(out.front().isApprox(raw.front()));
+  EXPECT_TRUE(out.back().isApprox(raw.back()));
+  EXPECT_LE(MaxCurvature(out), robot.max_path_curvature);
+  // check_step bounds the *arc sample* chord, not the straight portions of the
+  // input path: 0.6 m of the incoming segment is legitimately left straight, so
+  // only non-collinear (arc) segments are required to stay within check_step.
+  for (std::size_t i = 0; i + 1 < out.size(); ++i) {
+    const Eigen::Vector3f segment = out[i + 1] - out[i];
+    EXPECT_GT(segment.norm(), 0.0f) << "duplicate point at " << i;
+    bool collinear_with_input = false;
+    for (std::size_t j = 0; j + 1 < raw.size(); ++j) {
+      const Eigen::Vector3f input = raw[j + 1] - raw[j];
+      if (segment.cross(input).norm() <= 1e-5f * segment.norm() * input.norm()) {
+        collinear_with_input = true;
+        break;
+      }
+    }
+    if (!collinear_with_input) {
+      EXPECT_LE(segment.norm(), params.check_step + 1e-4f)
+          << "arc chord exceeds check_step at " << i;
+    }
+  }
+  // The arc moves the path away from the sharp corner at (0.6, 5.4): no emitted
+  // point may sit on the original corner.
+  for (const Eigen::Vector3f& point : out) {
+    EXPECT_GT((point - raw[1]).norm(), 1e-3f);
+  }
+  // The same result is deterministic and the authoritative optimizer accepts it
+  // when the pre-fillet shortcut is disabled.
+  const auto again = PathOptimizer().fillet(raw, mesh, corridor, params, robot, trav);
+  ASSERT_EQ(again.size(), out.size());
+  for (std::size_t i = 0; i < out.size(); ++i) EXPECT_TRUE(again[i].isApprox(out[i]));
+
+  PlanParams isolated = params;
+  isolated.shortcut_enabled = false;
+  isolated.funnel_enabled = false;
+  const auto optimized = PathOptimizer().optimize(raw, mesh, corridor, isolated, robot, trav);
+  ASSERT_TRUE(optimized.ok()) << optimized.status().message;
+  EXPECT_LE(MaxCurvature(optimized.value()), robot.max_path_curvature);
+}
+
+// T34: the same 90-degree turn on a much shorter pair of segments cannot hold
+// the 4.2 m tangent distance. The radius is never shrunk below the curvature
+// limit, so the corner is left unchanged and optimize() reports the failure
+// instead of hiding it with degenerate points.
+TEST(PathOptimizerTest, FilletLeavesTooShortTurnInfeasible) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kFlatPlane);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  const PlanParams params;
+  const std::vector<Eigen::Vector3f> raw = {{2.0f, 2.0f, kFlatZ},
+                                            {3.0f, 3.0f, kFlatZ},
+                                            {2.0f, 4.0f, kFlatZ}};
+  ASSERT_GT(MaxCurvature(raw), robot.max_path_curvature);
+
+  const auto out = PathOptimizer().fillet(raw, mesh, corridor, params, robot, trav);
+  ASSERT_EQ(out.size(), raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) EXPECT_TRUE(out[i].isApprox(raw[i]));
+  EXPECT_GT(MaxCurvature(out), robot.max_path_curvature);
+
+  PlanParams isolated = params;
+  isolated.shortcut_enabled = false;
+  isolated.funnel_enabled = false;
+  isolated.smoothing_enabled = false;
+  const auto optimized = PathOptimizer().optimize(raw, mesh, corridor, isolated, robot, trav);
+  ASSERT_FALSE(optimized.ok());
+  EXPECT_EQ(optimized.status().code, ErrorCode::kPathOptimizationFailed);
+}
+
+// T34: a U-turn needs an infinite tangent, so it can never be rounded with a
+// finite-radius arc; the input is returned unchanged (endpoints included).
+TEST(PathOptimizerTest, FilletRejectsUTurn) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kFlatPlane);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  const PlanParams params;
+  const std::vector<Eigen::Vector3f> raw = {{2.0f, 2.0f, kFlatZ},
+                                            {4.0f, 2.0f, kFlatZ},
+                                            {2.0f, 2.2f, kFlatZ}};
+  const auto out = PathOptimizer().fillet(raw, mesh, corridor, params, robot, trav);
+  ASSERT_EQ(out.size(), raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) EXPECT_TRUE(out[i].isApprox(raw[i]));
+}
+
+// T34: a nearly collinear corner is not a violating corner and must not be
+// rounded, so the point count and geometry are untouched.
+TEST(PathOptimizerTest, FilletLeavesCollinearCornerUntouched) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kFlatPlane);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  const PlanParams params;
+  const std::vector<Eigen::Vector3f> raw = {{1.5f, 2.0f, kFlatZ},
+                                            {2.5f, 2.0f, kFlatZ},
+                                            {3.5f, 2.0f, kFlatZ}};
+  const auto out = PathOptimizer().fillet(raw, mesh, corridor, params, robot, trav);
+  ASSERT_EQ(out.size(), raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) EXPECT_TRUE(out[i].isApprox(raw[i]));
 }

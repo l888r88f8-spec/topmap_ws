@@ -2,15 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <limits>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 
 #include "topmap_core/geometry.hpp"
 #include "topmap_surface/traversability.hpp"
@@ -329,6 +328,42 @@ bool SharesTraversableEdge(const TriangleMesh& mesh, const TraversabilityParams&
   return false;
 }
 
+// Consecutive samples may straddle a mesh vertex. The triangles containing the
+// two samples can then be separated by several triangles in the local vertex
+// fan even though the short path segment is continuous. Search only triangles
+// within the projection tolerance of the current sample, and require every
+// crossed edge and intermediate triangle to remain traversable.
+bool ConnectedNearPoint(const TriangleMesh& mesh, const TraversabilityParams& trav,
+                        TriangleId a, TriangleId b, const Eigen::Vector3f& point,
+                        float tolerance) {
+  if (SharesTraversableEdge(mesh, trav, a, b)) return true;
+  if (a < 0 || b < 0 || mesh.componentId(a) != mesh.componentId(b)) return false;
+  std::vector<char> visited(mesh.size(), 0);
+  std::vector<TriangleId> queue;
+  queue.push_back(a);
+  visited[static_cast<std::size_t>(a)] = 1;
+  for (std::size_t cursor = 0; cursor < queue.size(); ++cursor) {
+    const TriangleId current = queue[cursor];
+    for (const TriangleEdge& edge : mesh.triangle(current).edges) {
+      const TriangleId next = edge.neighbor;
+      if (next == kInvalidId || visited[static_cast<std::size_t>(next)] || !edge.traversable) {
+        continue;
+      }
+      const TriangleNode& next_triangle = mesh.triangle(next);
+      if (!TraversabilityEvaluator::isRobotPlaceable(next_triangle, trav) ||
+          !TraversabilityEvaluator::isEdgeTraversable(mesh.triangle(current), next_triangle,
+                                                      trav) ||
+          TriangleDistance(mesh, next, point) > tolerance) {
+        continue;
+      }
+      if (next == b) return true;
+      visited[static_cast<std::size_t>(next)] = 1;
+      queue.push_back(next);
+    }
+  }
+  return false;
+}
+
 // Projects `point` onto a placeable triangle, resolving the shared-edge/shared-
 // vertex ambiguity against the previously located sample so a legitimate corner
 // touch is not misread as a non-traversable jump.
@@ -336,9 +371,14 @@ bool LocatePlaceable(const MeshGrid& grid, const TriangleMesh& mesh,
                      const TraversabilityParams& trav, const Eigen::Vector3f& point,
                      TriangleId previous, float tolerance, TriangleId* located) {
   TriangleId nearest = kInvalidId;
-  if (!grid.NearestPlaceable(point, trav, tolerance, &nearest, nullptr)) return false;
+  if (!grid.NearestWithin(point, tolerance, &nearest, nullptr)) return false;
+  const TriangleNode& nearest_triangle = mesh.triangle(nearest);
+  if (!TraversabilityEvaluator::isRobotPlaceable(nearest_triangle, trav) ||
+      nearest_triangle.normal.dot(point - nearest_triangle.centroid) < -trav.max_step_height) {
+    return false;
+  }
   if (previous == kInvalidId || nearest == previous ||
-      SharesTraversableEdge(mesh, trav, previous, nearest)) {
+      ConnectedNearPoint(mesh, trav, previous, nearest, point, tolerance)) {
     *located = nearest;
     return true;
   }
@@ -398,70 +438,31 @@ std::vector<Sample> Resample(const std::vector<Eigen::Vector3f>& path, float che
   return samples;
 }
 
-std::uint64_t EdgeKey(PointId a, PointId b) {
-  const std::uint32_t low = static_cast<std::uint32_t>(std::min(a, b));
-  const std::uint32_t high = static_cast<std::uint32_t>(std::max(a, b));
-  return (static_cast<std::uint64_t>(low) << 32) | static_cast<std::uint64_t>(high);
-}
-
-// Average upward normal of the mesh triangles incident to an undirected edge.
-// Boundary-chain edges are shared mesh edges, so this recovers the local surface
-// tangent plane without needing the Region partition.
-class EdgeNormals {
- public:
-  explicit EdgeNormals(const TriangleMesh& mesh) {
-    for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
-      const TriangleNode& triangle = mesh.triangle(id);
-      for (int k = 0; k < 3; ++k) {
-        const PointId u = triangle.vertex_ids[k];
-        const PointId v = triangle.vertex_ids[(k + 1) % 3];
-        if (!Valid(u) || !Valid(v)) continue;
-        // Eigen's fixed-size default constructor does not zero its storage, so
-        // operator[] would make the first `+=` read indeterminate memory. Seed
-        // the accumulator explicitly.
-        sums_.try_emplace(EdgeKey(u, v), Eigen::Vector3d::Zero())
-            .first->second += triangle.normal.cast<double>();
-      }
-    }
-  }
-
-  Eigen::Vector3d Normal(PointId u, PointId v) const {
-    const auto it = sums_.find(EdgeKey(u, v));
-    if (it == sums_.end() || it->second.squaredNorm() < 1e-12) {
-      return Eigen::Vector3d::UnitZ();
-    }
-    return it->second.normalized();
-  }
-
- private:
-  static bool Valid(PointId id) { return id >= 0; }
-  std::unordered_map<std::uint64_t, Eigen::Vector3d> sums_;
-};
-
-// Tests whether segment [a,b] passes through the local "fence" spanned by edge
-// [c,d]: the path must cross the edge's tangent plane (sign flip), the crossing
-// point must lie within the edge extent, and it must be within `tolerance` of the
-// edge itself. This is a true geometric intersection with the shared-edge
-// geometry, so parallel Portals on the same Region pair are told apart.
-bool CrossesFence(const Eigen::Vector3d& a, const Eigen::Vector3d& b, const Eigen::Vector3d& c,
-                  const Eigen::Vector3d& d, const Eigen::Vector3d& edge_normal, double* s_out) {
+// Tests whether segment [a,b] passes through the vertical curtain spanned by the
+// shared edge [c,d], evaluated on the XY projection. The edge's local surface
+// normal is deliberately not used: on a ramp the averaged normal tilts the fence
+// plane, so a chord above the boundary would miss the crossing, yet a robot
+// crossing the ramp genuinely traverses the boundary chain. The sign test keeps
+// a path running parallel to (or along) the chain from being reported, and the
+// `along` window keeps the hit on the actual edge extent, so parallel Portals on
+// the same Region pair remain distinguishable by their boundary geometry.
+bool CrossesCurtain(const Eigen::Vector3d& a, const Eigen::Vector3d& b, const Eigen::Vector3d& c,
+                    const Eigen::Vector3d& d, double* s_out) {
   if (!a.allFinite() || !b.allFinite() || !c.allFinite() || !d.allFinite()) return false;
-  const Eigen::Vector3d edge = d - c;
+  const Eigen::Vector2d a2(a.x(), a.y());
+  const Eigen::Vector2d b2(b.x(), b.y());
+  const Eigen::Vector2d c2(c.x(), c.y());
+  const Eigen::Vector2d d2(d.x(), d.y());
+  const Eigen::Vector2d edge = d2 - c2;
   const double length = edge.norm();
   if (!(length > 1e-9)) return false;
-  const Eigen::Vector3d direction = edge / length;
-  Eigen::Vector3d normal = edge_normal;
-  if (!normal.allFinite() || normal.squaredNorm() < 1e-12) normal = Eigen::Vector3d::UnitZ();
-  normal.normalize();
+  const Eigen::Vector2d direction = edge / length;
+  const Eigen::Vector2d normal(-direction.y(), direction.x());
 
-  const Eigen::Vector3d fence_normal = normal.cross(direction);
-  if (!fence_normal.allFinite() || fence_normal.squaredNorm() < 1e-12) return false;
-  const Eigen::Vector3d m = fence_normal.normalized();
-
-  const double fa = (a - c).dot(m);
-  const double fb = (b - c).dot(m);
+  const double fa = (a2 - c2).dot(normal);
+  const double fb = (b2 - c2).dot(normal);
   // A path vertex may land exactly on the boundary chain (e.g. the planner
-  // routes through a Portal centre), so an endpoint on the fence counts: both
+  // routes through a Portal centre), so an endpoint on the curtain counts: both
   // adjacent segments then report the same Portal and the caller de-duplicates.
   if (fa > 0.0 && fb > 0.0) return false;
   if (fa < 0.0 && fb < 0.0) return false;
@@ -469,13 +470,52 @@ bool CrossesFence(const Eigen::Vector3d& a, const Eigen::Vector3d& b, const Eige
 
   const double s = fa / (fa - fb);
   if (s < 0.0 || s > 1.0) return false;
-  const Eigen::Vector3d crossing = a + (b - a) * s;
-  const double along = (crossing - c).dot(direction);
+  const Eigen::Vector2d crossing = a2 + (b2 - a2) * s;
+  const double along = (crossing - c2).dot(direction);
   if (along < -kFenceTolerance || along > length + kFenceTolerance) return false;
-  const double offset = ((crossing - c) - along * direction).norm();
-  if (offset > kFenceTolerance) return false;
 
   if (s_out != nullptr) *s_out = s;
+  return true;
+}
+
+// Samples segment [a,b] at an interval <= check_step and requires every sample
+// to project onto a robot-placeable, front-facing triangle with traversable
+// edge transitions. This mirrors the per-sample body of validate(), so a graph
+// edge that passes here cannot later fail validate()'s clearance/placeability
+// gate.
+bool SegmentSampledSafe(const MeshGrid& grid, const TriangleMesh& mesh,
+                        const TraversabilityParams& params, const Eigen::Vector3f& a,
+                        const Eigen::Vector3f& b, float check_step) {
+  const float length = (b - a).norm();
+  if (!IsFinite(length)) return false;
+  int steps = static_cast<int>(std::ceil(length / check_step));
+  if (steps < 1) steps = 1;
+  TriangleId previous = kInvalidId;
+  for (int s = 0; s <= steps; ++s) {
+    const float t = static_cast<float>(s) / static_cast<float>(steps);
+    const Eigen::Vector3f sample = a + (b - a) * t;
+
+    TriangleId nearest = kInvalidId;
+    float nearest_distance = kInf;
+    if (!grid.NearestWithin(sample, kProjectionTolerance, &nearest, &nearest_distance)) {
+      return false;
+    }
+    const TriangleNode& nearest_triangle = mesh.triangle(nearest);
+    if (!TraversabilityEvaluator::isRobotPlaceable(nearest_triangle, params) ||
+        nearest_triangle.normal.dot(sample - nearest_triangle.centroid) < -params.max_step_height) {
+      return false;
+    }
+
+    TriangleId current = kInvalidId;
+    if (!LocatePlaceable(grid, mesh, params, sample, previous, kProjectionTolerance, &current)) {
+      return false;
+    }
+    if (previous != kInvalidId && current != previous &&
+        !ConnectedNearPoint(mesh, params, previous, current, sample, kProjectionTolerance)) {
+      return false;
+    }
+    previous = current;
+  }
   return true;
 }
 
@@ -561,14 +601,8 @@ PathValidationReport SafetyValidator::validate(const std::vector<Eigen::Vector3f
     if (a == kInvalidId || b == kInvalidId || a == b) continue;
     const TriangleNode& ta = mesh.triangle(a);
     const TriangleNode& tb = mesh.triangle(b);
-    bool adjacent = false;
-    for (const TriangleEdge& edge : ta.edges) {
-      if (edge.neighbor == b) {
-        adjacent = true;
-        break;
-      }
-    }
-    if (!adjacent) {
+    if (!ConnectedNearPoint(mesh, params, a, b, samples[k + 1].point,
+                            kProjectionTolerance)) {
       record(samples[k].source);
       continue;
     }
@@ -611,6 +645,34 @@ PathValidationReport SafetyValidator::validate(const std::vector<Eigen::Vector3f
       report.violating_indices.end());
   report.valid = report.violating_indices.empty();
   return report;
+}
+
+Result<std::vector<char>> SafetyValidator::validateSegments(
+    const std::vector<std::pair<Eigen::Vector3f, Eigen::Vector3f>>& segments,
+    const TriangleMesh& mesh, const TraversabilityParams& params, float check_step) const {
+  if (!IsFinite(check_step) || !(check_step > 0.0f)) {
+    return Invalid("validateSegments check_step must be finite and positive");
+  }
+  if (!ValidateTraversabilityParams(params).ok()) {
+    return Invalid("validateSegments received invalid traversability parameters");
+  }
+  if (mesh.size() == 0) return Invalid("validateSegments called on an empty mesh");
+  for (const std::pair<Eigen::Vector3f, Eigen::Vector3f>& segment : segments) {
+    if (!IsFinite(segment.first) || !IsFinite(segment.second)) {
+      return Invalid("validateSegments segment endpoint is not finite");
+    }
+  }
+
+  // One spatial index for the whole batch; every segment reuses it.
+  MeshGrid grid;
+  grid.Build(mesh);
+  std::vector<char> safe;
+  safe.reserve(segments.size());
+  for (const std::pair<Eigen::Vector3f, Eigen::Vector3f>& segment : segments) {
+    safe.push_back(
+        SegmentSampledSafe(grid, mesh, params, segment.first, segment.second, check_step) ? 1 : 0);
+  }
+  return safe;
 }
 
 Result<TriangleId> SafetyValidator::locatePoint(const TriangleMesh& mesh, const Eigen::Vector3f& p,
@@ -693,7 +755,6 @@ std::vector<PortalId> SafetyValidator::crossedPortals(const std::vector<Eigen::V
 
   const std::vector<Eigen::Vector3f>& vertices = mesh.vertices();
   const std::size_t vertex_count = vertices.size();
-  const EdgeNormals edge_normals(mesh);
 
   struct Hit {
     double s = 0.0;
@@ -716,9 +777,8 @@ std::vector<PortalId> SafetyValidator::crossedPortals(const std::vector<Eigen::V
           continue;
         }
         double s = 0.0;
-        if (CrossesFence(a, b, vertices[static_cast<std::size_t>(u)].cast<double>(),
-                         vertices[static_cast<std::size_t>(v)].cast<double>(),
-                         edge_normals.Normal(u, v), &s)) {
+        if (CrossesCurtain(a, b, vertices[static_cast<std::size_t>(u)].cast<double>(),
+                           vertices[static_cast<std::size_t>(v)].cast<double>(), &s)) {
           best_s = std::min(best_s, s);
         }
       }

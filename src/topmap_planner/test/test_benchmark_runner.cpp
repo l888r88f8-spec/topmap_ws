@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -204,19 +205,112 @@ TEST(BenchmarkRunnerTest, OverlappingFloorsExpectedUnreachableSemantics) {
   for (const BenchmarkRecord& record : records.value()) {
     EXPECT_TRUE(record.expected_unreachable) << record.method;
     EXPECT_TRUE(record.success) << record.method;
-    EXPECT_NE(record.error_code, 0) << record.method;
+    // T33 contract: every correctly-rejected unreachable row exposes the
+    // planning-stage unreachable code (602), not the geometric method's own
+    // no-path code. This is result normalization, not a found path.
+    EXPECT_EQ(record.error_code, static_cast<int>(ErrorCode::kTopologyUnreachable))
+        << record.method;
     // A-01: there must be no passable cross-floor connection.
     EXPECT_EQ(record.invalid_cross_layer_edges, 0) << record.method;
     EXPECT_EQ(record.path_length, 0.0f) << record.method;
   }
-  // Method C rejects the scene before geometry via the topology graph.
-  EXPECT_EQ(records.value()[2].error_code,
-            static_cast<int>(ErrorCode::kTopologyUnreachable));
-  // The geometric methods must fail with their own genuine no-path code.
-  EXPECT_NE(records.value()[0].error_code,
-            static_cast<int>(ErrorCode::kTopologyUnreachable));
-  EXPECT_NE(records.value()[1].error_code,
-            static_cast<int>(ErrorCode::kTopologyUnreachable));
+}
+
+// A-01: the ramp's Region bands are disjoint (the ramp spans the whole rise),
+// but its flat<->ramp interfaces are continuous robot-traversable steps, so no
+// row may report a cross-layer violation.
+TEST(BenchmarkRunnerTest, RampHasNoInvalidCrossLayerEdges) {
+  const TopmapConfig cfg;
+  auto records = topmap::runBenchmark(
+      {SyntheticScene::kRamp},
+      {PlanningMethod::kPointCloudAStar, PlanningMethod::kMeshAStar, PlanningMethod::kHierarchical},
+      cfg, 0.25f);
+  ASSERT_TRUE(records.ok()) << records.status().message;
+  ASSERT_EQ(records.value().size(), 3u);
+  for (const BenchmarkRecord& record : records.value()) {
+    EXPECT_EQ(record.invalid_cross_layer_edges, 0) << record.method;
+  }
+}
+
+// A-01 unit contract: a cross-layer join is only invalid when the interface
+// step exceeds the configured limit. The two cases differ solely in the step.
+TEST(BenchmarkRunnerTest, CrossLayerMetricHonoursStepThreshold) {
+  const auto build = [](float step) {
+    std::vector<topmap::SurfaceRegion> regions(2);
+    regions[0].id = 0;
+    regions[0].min_z = 0.0f;
+    regions[0].max_z = 0.0f;
+    regions[1].id = 1;
+    regions[1].min_z = 3.0f;
+    regions[1].max_z = 3.0f;
+    std::vector<topmap::Portal> portals(1);
+    portals[0].id = 0;
+    portals[0].region_a = 0;
+    portals[0].region_b = 1;
+    portals[0].boundary_chain = {0, 1};
+    portals[0].max_step = step;
+    auto built = topmap::TopologyGraph::build(regions, portals);
+    EXPECT_TRUE(built.ok()) << built.status().message;
+    return built.take();
+  };
+
+  const topmap::TraversabilityParams trav;
+  // Continuous (ramp-like) interface: disjoint bands, but traversable.
+  EXPECT_EQ(topmap::CountInvalidCrossLayerEdges(build(0.0f), trav), 0);
+  EXPECT_EQ(topmap::CountInvalidCrossLayerEdges(build(trav.max_step_height), trav), 0);
+  // Genuinely stepped cross-floor join: above the limit, counted once.
+  EXPECT_EQ(topmap::CountInvalidCrossLayerEdges(build(trav.max_step_height + 0.1f), trav), 1);
+}
+
+// T33 Method A/B safety: whenever a point_cloud/mesh row reports a path, that
+// path must be one SafetyValidator accepts, so its reported clearance meets the
+// robot requirement. These topology-preservation scenes are all reachable, so
+// failure to construct a curvature-safe path is itself a regression.
+TEST(BenchmarkRunnerTest, PointCloudAndMeshRespectRequiredClearance) {
+  const TopmapConfig cfg;
+  const std::vector<SyntheticScene> scenes = {
+      SyntheticScene::kSingleBridge, SyntheticScene::kParallelPortals,
+      SyntheticScene::kLoop, SyntheticScene::kTShape};
+  for (const SyntheticScene scene : scenes) {
+    auto records = topmap::runBenchmark(
+        {scene}, {PlanningMethod::kPointCloudAStar, PlanningMethod::kMeshAStar}, cfg, 0.25f);
+    ASSERT_TRUE(records.ok()) << records.status().message;
+    ASSERT_EQ(records.value().size(), 2u);
+    for (const BenchmarkRecord& record : records.value()) {
+      ASSERT_TRUE(record.success) << record.scene << "/" << record.method
+                                  << " error_code=" << record.error_code;
+      EXPECT_GE(record.min_clearance, cfg.traversability.required_clearance)
+          << record.scene << "/" << record.method;
+      EXPECT_NE(record.error_code, static_cast<int>(ErrorCode::kPathValidationFailed))
+          << record.scene << "/" << record.method;
+    }
+  }
+}
+
+TEST(BenchmarkRunnerTest, BranchingScenesPreserveHierarchicalPortalOrder) {
+  const TopmapConfig cfg;
+  for (const SyntheticScene scene : {SyntheticScene::kParallelPortals,
+                                     SyntheticScene::kTShape}) {
+    auto records = topmap::runBenchmark({scene}, {PlanningMethod::kHierarchical}, cfg, 0.25f);
+    ASSERT_TRUE(records.ok()) << records.status().message;
+    ASSERT_EQ(records.value().size(), 1u);
+    const BenchmarkRecord& record = records.value().front();
+    EXPECT_TRUE(record.success) << record.scene << " error_code=" << record.error_code;
+    EXPECT_TRUE(record.portal_order_valid) << record.scene;
+    EXPECT_GE(record.min_clearance, cfg.traversability.required_clearance) << record.scene;
+  }
+}
+
+TEST(BenchmarkRunnerTest, RampHierarchicalSurfaceExpansionsBeatFullMesh) {
+  const TopmapConfig cfg;
+  auto records = topmap::runBenchmark(
+      {SyntheticScene::kRamp},
+      {PlanningMethod::kMeshAStar, PlanningMethod::kHierarchical}, cfg, 0.25f);
+  ASSERT_TRUE(records.ok()) << records.status().message;
+  ASSERT_EQ(records.value().size(), 2u);
+  ASSERT_TRUE(records.value()[0].success);
+  ASSERT_TRUE(records.value()[1].success);
+  EXPECT_LT(records.value()[1].expanded_nodes, records.value()[0].expanded_nodes);
 }
 
 TEST(BenchmarkRunnerTest, DeterministicRecordOrdering) {

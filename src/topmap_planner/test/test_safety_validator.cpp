@@ -3,11 +3,13 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
 
 #include "topmap_planner/corridor_builder.hpp"
+#include "topmap_planner/region_locator.hpp"
 #include "topmap_planner/safety_validator.hpp"
 #include "topmap_planner/surface_astar.hpp"
 #include "topmap_planner/topology_astar.hpp"
@@ -79,6 +81,42 @@ HallPlan MakeHallPlan() {
   return plan;
 }
 
+// Same plan construction for the sloped ramp scene, whose flat<->ramp Portal
+// boundary chains are horizontal while the planner's chords sit above them.
+HallPlan MakeRampPlan() {
+  HallPlan plan;
+  plan.prepared = BuildScene(topmap::SyntheticScene::kRamp);
+  const TriangleMesh& mesh = plan.prepared.mesh;
+  const TopologyGraph& graph = plan.prepared.graph;
+
+  auto endpoints = topmap::makeSyntheticEndpoints(topmap::SyntheticScene::kRamp);
+  EXPECT_TRUE(endpoints.ok()) << endpoints.status().message;
+  const topmap::RegionLocator locator;
+  const topmap::PlanParams params;
+  auto start_region = locator.locate(mesh, graph, endpoints.value().first, params);
+  auto goal_region = locator.locate(mesh, graph, endpoints.value().second, params);
+  EXPECT_TRUE(start_region.ok()) << start_region.status().message;
+  EXPECT_TRUE(goal_region.ok()) << goal_region.status().message;
+
+  auto topology = topmap::TopologyAStar().search(graph, start_region.value(), goal_region.value(),
+                                                 1.0f, nullptr);
+  EXPECT_TRUE(topology.ok()) << topology.status().message;
+  plan.expected = topology.value().portals;
+
+  auto corridor = topmap::CorridorBuilder().build(mesh, graph, topology.value(), 1);
+  EXPECT_TRUE(corridor.ok()) << corridor.status().message;
+
+  std::vector<Eigen::Vector3f> waypoints{endpoints.value().first};
+  for (PortalId pid : plan.expected) waypoints.push_back(graph.portal(pid)->center);
+  waypoints.push_back(endpoints.value().second);
+
+  auto path =
+      topmap::SurfaceAStar().search(mesh, corridor.value(), waypoints, TraversabilityParams{});
+  EXPECT_TRUE(path.ok()) << path.status().message;
+  plan.path = path.value();
+  return plan;
+}
+
 // Plan example: a three-point path near the centre of the flat plane is safe.
 TEST(SafetyValidatorTest, ValidPathPasses) {
   const topmap::test::Prepared prepared = BuildScene(topmap::SyntheticScene::kFlatPlane);
@@ -116,6 +154,51 @@ TEST(SafetyValidatorTest, PortalOrderIsVerifiable) {
             plan.expected);
   EXPECT_TRUE(SafetyValidator::portalOrderMatches(plan.path, plan.prepared.mesh,
                                                   plan.prepared.graph, plan.expected));
+}
+
+// A-03: on the sloped ramp the flat<->ramp boundary chain is horizontal but the
+// path chord can lie above it in z, so the crossing must be detected as an XY
+// projected boundary-chain intersection (a vertical curtain) rather than by the
+// tilted local surface plane.
+TEST(SafetyValidatorTest, CrossedPortalsDetectsRampBoundaryCrossing) {
+  const HallPlan plan = MakeRampPlan();
+  ASSERT_EQ(plan.expected.size(), 2u);
+  EXPECT_EQ(SafetyValidator::crossedPortals(plan.path, plan.prepared.mesh, plan.prepared.graph),
+            plan.expected);
+  EXPECT_TRUE(SafetyValidator::portalOrderMatches(plan.path, plan.prepared.mesh,
+                                                  plan.prepared.graph, plan.expected));
+}
+
+// A-03: a chord that passes over a ramp boundary chain in the XY plane must be
+// detected even when its z is far from the (horizontal) chain, because the
+// crossing test is a vertical curtain, not the tilted local surface plane.
+TEST(SafetyValidatorTest, CrossedPortalsDetectsChordAboveRampBoundary) {
+  const topmap::test::Prepared prepared = BuildScene(topmap::SyntheticScene::kRamp);
+  const TriangleMesh& mesh = prepared.mesh;
+  const TopologyGraph& graph = prepared.graph;
+  ASSERT_FALSE(graph.portals().empty());
+  const Portal& portal = graph.portals().front();
+  ASSERT_GE(portal.boundary_chain.size(), 2u);
+
+  const Eigen::Vector3f c = mesh.vertices()[portal.boundary_chain.front()];
+  const Eigen::Vector3f d = mesh.vertices()[portal.boundary_chain.back()];
+  const Eigen::Vector3f midpoint = 0.5f * (c + d);
+  Eigen::Vector2f direction(d.x() - c.x(), d.y() - c.y());
+  if (direction.norm() < 1e-6f) direction = Eigen::Vector2f(1.0f, 0.0f);
+  direction.normalize();
+  const Eigen::Vector2f perpendicular(-direction.y(), direction.x());
+  // A horizontal chord 0.6 m above the chain, crossing it at its midpoint.
+  const float z = midpoint.z() + 0.6f;
+  const std::vector<Eigen::Vector3f> path = {
+      Eigen::Vector3f(midpoint.x() + perpendicular.x() * 0.5f,
+                      midpoint.y() + perpendicular.y() * 0.5f, z),
+      Eigen::Vector3f(midpoint.x() - perpendicular.x() * 0.5f,
+                      midpoint.y() - perpendicular.y() * 0.5f, z)};
+
+  const std::vector<PortalId> crossed =
+      SafetyValidator::crossedPortals(path, mesh, graph);
+  ASSERT_EQ(crossed.size(), 1u);
+  EXPECT_EQ(crossed[0], portal.id);
 }
 
 // locatePoint must reject non-finite queries, invalid radii and empty meshes.
@@ -481,6 +564,87 @@ TEST(SafetyValidatorTest, CrossedPortalsDoesNotInventCrossings) {
   std::vector<Eigen::Vector3f> path = {{1.0f, 1.0f, 0}, {2.0f, 1.0f, 0}};
   EXPECT_TRUE(
       SafetyValidator::crossedPortals(path, prepared.mesh, prepared.graph).empty());
+}
+
+// T33 batch API contract: malformed arguments are reported as kInvalidArgument
+// and never as a silently empty result. An empty batch on a valid mesh is a
+// legitimate empty answer, not an error.
+TEST(SafetyValidatorTest, ValidateSegmentsRejectsInvalidArguments) {
+  const topmap::test::Prepared prepared = BuildScene(topmap::SyntheticScene::kFlatPlane);
+  const SafetyValidator validator;
+  const TraversabilityParams trav;
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  const std::vector<std::pair<Eigen::Vector3f, Eigen::Vector3f>> good = {
+      {Eigen::Vector3f(3.0f, 3.0f, 0.0f), Eigen::Vector3f(3.5f, 3.0f, 0.0f)}};
+
+  for (float step : {0.0f, -1.0f, nan, inf}) {
+    auto r = validator.validateSegments(good, prepared.mesh, trav, step);
+    EXPECT_FALSE(r.ok()) << "check_step=" << step;
+    if (!r.ok()) {
+      EXPECT_EQ(r.status().code, topmap::ErrorCode::kInvalidArgument);
+    }
+  }
+
+  TriangleMesh empty;
+  auto on_empty = validator.validateSegments(good, empty, trav, 0.05f);
+  EXPECT_FALSE(on_empty.ok());
+  if (!on_empty.ok()) {
+    EXPECT_EQ(on_empty.status().code, topmap::ErrorCode::kInvalidArgument);
+  }
+
+  const std::vector<std::pair<Eigen::Vector3f, Eigen::Vector3f>> nonfinite = {
+      {Eigen::Vector3f(3.0f, 3.0f, 0.0f), Eigen::Vector3f(nan, 3.0f, 0.0f)}};
+  auto bad_point = validator.validateSegments(nonfinite, prepared.mesh, trav, 0.05f);
+  EXPECT_FALSE(bad_point.ok());
+  if (!bad_point.ok()) {
+    EXPECT_EQ(bad_point.status().code, topmap::ErrorCode::kInvalidArgument);
+  }
+
+  TraversabilityParams bad_trav;
+  bad_trav.required_clearance = -1.0f;
+  auto bad_params = validator.validateSegments(good, prepared.mesh, bad_trav, 0.05f);
+  EXPECT_FALSE(bad_params.ok());
+  if (!bad_params.ok()) {
+    EXPECT_EQ(bad_params.status().code, topmap::ErrorCode::kInvalidArgument);
+  }
+
+  auto none = validator.validateSegments({}, prepared.mesh, trav, 0.05f);
+  ASSERT_TRUE(none.ok()) << none.status().message;
+  EXPECT_TRUE(none.value().empty());
+}
+
+// T33 batch API correctness: each returned bit must agree with validate() run on
+// the same two-point path, which is exactly the guarantee BuildPointGraph relies
+// on to drop chords that leave the placeable free space.
+TEST(SafetyValidatorTest, ValidateSegmentsMatchesValidatePerSegment) {
+  const topmap::test::Prepared prepared = BuildScene(topmap::SyntheticScene::kFlatPlane);
+  const SafetyValidator validator;
+  const TraversabilityParams trav;
+  const RobotParams robot;
+  const std::vector<std::pair<Eigen::Vector3f, Eigen::Vector3f>> segments = {
+      // Mid-floor chord: placeable and clear.
+      {Eigen::Vector3f(3.0f, 3.0f, 0.0f), Eigen::Vector3f(3.5f, 3.0f, 0.0f)},
+      // Chord hugging the mesh boundary: clear < required_clearance.
+      {Eigen::Vector3f(1.0f, 0.2f, 0.0f), Eigen::Vector3f(2.0f, 0.2f, 0.0f)},
+      // Chord that leaves the surface.
+      {Eigen::Vector3f(3.0f, 3.0f, 0.0f), Eigen::Vector3f(3.0f, 3.0f, 1.0f)}};
+
+  auto batch = validator.validateSegments(segments, prepared.mesh, trav, 0.05f);
+  ASSERT_TRUE(batch.ok()) << batch.status().message;
+  ASSERT_EQ(batch.value().size(), segments.size());
+  EXPECT_EQ(batch.value()[0], 1);
+  EXPECT_EQ(batch.value()[1], 0);
+  EXPECT_EQ(batch.value()[2], 0);
+
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    const std::vector<Eigen::Vector3f> single = {segments[i].first, segments[i].second};
+    const PathValidationReport report =
+        validator.validate(single, prepared.mesh, trav, robot, 0.05f);
+    EXPECT_EQ(static_cast<bool>(batch.value()[i]), report.valid)
+        << "segment " << i << " batch=" << static_cast<int>(batch.value()[i])
+        << " validate=" << report.valid;
+  }
 }
 
 }  // namespace

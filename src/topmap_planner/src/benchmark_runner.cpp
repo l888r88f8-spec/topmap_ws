@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -17,9 +16,11 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 
 #include "topmap_core/geometry.hpp"
 #include "topmap_planner/hierarchical_planner.hpp"
+#include "topmap_planner/path_optimizer.hpp"
 #include "topmap_planner/region_locator.hpp"
 #include "topmap_planner/safety_validator.hpp"
 #include "topmap_planner/surface_astar.hpp"
@@ -77,6 +78,20 @@ float PathLength(const std::vector<Eigen::Vector3f>& path) {
     length += (path[i + 1] - path[i]).norm();
   }
   return length;
+}
+
+// T34: the post-processing corridor for Methods A/B. Both search on a full
+// placeable-mesh graph, so their raw path is optimized over the same triangle
+// set rather than a topology corridor.
+Corridor FullMeshCorridor(const TriangleMesh& mesh, const TraversabilityParams& trav) {
+  Corridor corridor;
+  corridor.triangles.reserve(mesh.size());
+  for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
+    if (TraversabilityEvaluator::isRobotPlaceable(mesh.triangle(id), trav)) {
+      corridor.triangles.push_back(id);
+    }
+  }
+  return corridor;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,19 +192,12 @@ Result<SceneData> BuildScene(SyntheticScene scene, const TopmapConfig& config) {
 }
 
 // A-01: a cross-layer connection is a Portal whose two Regions occupy disjoint
-// height bands. The shared-edge mesh itself cannot produce one; this is the
-// transitive Region-level check.
-int CountInvalidCrossLayerEdges(const TopologyGraph& graph) {
-  int count = 0;
-  for (const Portal& portal : graph.portals()) {
-    const SurfaceRegion* a = graph.region(portal.region_a);
-    const SurfaceRegion* b = graph.region(portal.region_b);
-    if (a == nullptr || b == nullptr) continue;
-    if (a->max_z < b->min_z || b->max_z < a->min_z) ++count;
-  }
-  return count;
-}
-
+// height bands *and* whose interface step is not robot-traversable. The
+// shared-edge mesh itself cannot produce a discontinuous join, so this is the
+// transitive Region-level check. Disjoint bands alone are not enough: a
+// continuous ramp-to-flat interface has a ramp Region spanning the full rise
+// while the flat Regions pin to its ends, but the crossing step stays at or
+// below `trav.max_step_height` and the connection is legitimate.
 std::vector<PortalId> ExpectedPortalOrder(const TriangleMesh& mesh, const TopologyGraph& graph,
                                           const Eigen::Vector3f& start,
                                           const Eigen::Vector3f& goal,
@@ -214,19 +222,28 @@ std::vector<PortalId> ExpectedPortalOrder(const TriangleMesh& mesh, const Topolo
 // lies on a placeable triangle incident to one endpoint (the nearest-triangle
 // approximation of the plan). Candidate discovery uses a spatial hash so the
 // build is O(V * local density), never O(V^2).
+//
+// Failure contract: the sampled SafetyValidator batch is mandatory. When it
+// rejects its arguments (non-positive check_step, invalid traversability
+// parameters, non-finite endpoint) this returns that error and the caller must
+// treat the graph as unbuilt; it is never silently returned as an edgeless
+// graph. A candidate list that is empty for a valid mesh simply yields an
+// edgeless graph, which A* then reports as an ordinary no-path result.
 struct PointGraph {
   std::vector<Eigen::Vector3f> points;
   std::vector<std::vector<int>> adjacency;
   std::vector<char> usable;
+  std::vector<float> clearance;
 };
 
-PointGraph BuildPointGraph(const TriangleMesh& mesh, const TraversabilityParams& trav,
-                           float radius) {
+Result<PointGraph> BuildPointGraph(const TriangleMesh& mesh, const TraversabilityParams& trav,
+                                   float radius, float check_step) {
   const std::size_t count = mesh.vertices().size();
   PointGraph graph;
   graph.points = mesh.vertices();
   graph.adjacency.assign(count, std::vector<int>());
   graph.usable.assign(count, 0);
+  graph.clearance.assign(count, 0.0f);
 
   std::vector<TriangleId> best_triangle(count, kInvalidId);
   std::vector<float> best_clearance(count, 0.0f);
@@ -246,6 +263,7 @@ PointGraph BuildPointGraph(const TriangleMesh& mesh, const TraversabilityParams&
         graph.usable[index] = 1;
         best_triangle[index] = id;
         best_clearance[index] = triangle.min_clearance;
+        graph.clearance[index] = triangle.min_clearance;
       }
     }
   }
@@ -278,7 +296,11 @@ PointGraph BuildPointGraph(const TriangleMesh& mesh, const TraversabilityParams&
     return false;
   };
 
-  const auto edge_safe = [&](int u, int v) {
+  // Cheap, mesh-local pre-filter. A candidate must be placeable, in the same
+  // connected component, and either share a traversable edge or have its
+  // midpoint on a placeable incident triangle. The expensive per-sample
+  // clearance check runs afterwards on the surviving candidates.
+  const auto edge_candidate = [&](int u, int v) {
     if (!graph.usable[static_cast<std::size_t>(u)] ||
         !graph.usable[static_cast<std::size_t>(v)]) {
       return false;
@@ -320,6 +342,11 @@ PointGraph BuildPointGraph(const TriangleMesh& mesh, const TraversabilityParams&
   }
 
   const float radius_squared = radius * radius;
+  struct Candidate {
+    int u = -1;
+    int v = -1;
+  };
+  std::vector<Candidate> candidates;
   for (std::size_t index = 0; index < count; ++index) {
     if (!graph.usable[index]) continue;
     const int u = static_cast<int>(index);
@@ -336,13 +363,32 @@ PointGraph BuildPointGraph(const TriangleMesh& mesh, const TraversabilityParams&
                 radius_squared) {
               continue;
             }
-            if (edge_safe(u, v)) {
-              graph.adjacency[index].push_back(v);
-              graph.adjacency[static_cast<std::size_t>(v)].push_back(u);
-            }
+            if (edge_candidate(u, v)) candidates.push_back(Candidate{u, v});
           }
         }
       }
+    }
+  }
+
+  // T33: enforce the same per-sample clearance/placeability constraint that
+  // SafetyValidator applies, but over the whole candidate set in one pass with a
+  // shared spatial index. A chord that leaves the placeable free space is
+  // dropped, so A* can only return a path validate() accepts.
+  if (!candidates.empty()) {
+    std::vector<std::pair<Eigen::Vector3f, Eigen::Vector3f>> segments;
+    segments.reserve(candidates.size());
+    for (const Candidate& candidate : candidates) {
+      segments.emplace_back(graph.points[static_cast<std::size_t>(candidate.u)],
+                            graph.points[static_cast<std::size_t>(candidate.v)]);
+    }
+    const auto safe = SafetyValidator().validateSegments(segments, mesh, trav, check_step);
+    if (!safe.ok()) return safe.status();
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+      if (!safe.value()[i]) continue;
+      const std::size_t u = static_cast<std::size_t>(candidates[i].u);
+      const std::size_t v = static_cast<std::size_t>(candidates[i].v);
+      graph.adjacency[u].push_back(candidates[i].v);
+      graph.adjacency[v].push_back(candidates[i].u);
     }
   }
   for (std::vector<int>& neighbors : graph.adjacency) {
@@ -397,7 +443,16 @@ MethodOutcome EvaluatePointCloudAStar(const SceneData& data, const TopmapConfig&
                                       float point_radius) {
   MethodOutcome outcome;
   const Clock::time_point begin = Clock::now();
-  const PointGraph graph = BuildPointGraph(data.mesh, config.traversability, point_radius);
+  const Result<PointGraph> built =
+      BuildPointGraph(data.mesh, config.traversability, point_radius, config.plan.check_step);
+  if (!built.ok()) {
+    // BuildPointGraph only fails on invalid arguments, so surface the exact
+    // error instead of disguising it as a no-path result.
+    outcome.status = built.status();
+    outcome.planning_time_sec = SecondsBetween(begin, Clock::now());
+    return outcome;
+  }
+  const PointGraph& graph = built.value();
 
   const int start_vertex = NearestUsableVertex(graph, data.start);
   if (start_vertex < 0) {
@@ -435,9 +490,20 @@ MethodOutcome EvaluatePointCloudAStar(const SceneData& data, const TopmapConfig&
     if (node.id == goal_vertex) break;
     for (const int next : graph.adjacency[static_cast<std::size_t>(node.id)]) {
       if (closed[static_cast<std::size_t>(next)]) continue;
-      const float step = (graph.points[static_cast<std::size_t>(next)] -
-                          graph.points[static_cast<std::size_t>(node.id)])
-                             .norm();
+      const std::size_t current_index = static_cast<std::size_t>(node.id);
+      const std::size_t next_index = static_cast<std::size_t>(next);
+      const float geometric_step =
+          (graph.points[next_index] - graph.points[current_index]).norm();
+      const float clearance =
+          std::min(graph.clearance[current_index], graph.clearance[next_index]);
+      const float floor = std::max(0.1f * config.traversability.required_clearance, 1e-3f);
+      const float margin =
+          std::max(clearance - config.traversability.required_clearance, floor);
+      const float clearance_multiplier =
+          config.traversability.required_clearance > 0.0f
+              ? 1.0f + config.traversability.required_clearance / margin
+              : 1.0f;
+      const float step = geometric_step * clearance_multiplier;
       if (!IsFinite(step)) continue;
       const float candidate = g[static_cast<std::size_t>(node.id)] + step;
       if (!IsFinite(candidate)) continue;
@@ -448,8 +514,8 @@ MethodOutcome EvaluatePointCloudAStar(const SceneData& data, const TopmapConfig&
       }
     }
   }
-  outcome.planning_time_sec = SecondsBetween(begin, Clock::now());
   if (g[static_cast<std::size_t>(goal_vertex)] == kInf) {
+    outcome.planning_time_sec = SecondsBetween(begin, Clock::now());
     outcome.status = Status::Error(ErrorCode::kSurfaceSearchFailed,
                                    "point-cloud A* found no traversable vertex path");
     return outcome;
@@ -462,30 +528,41 @@ MethodOutcome EvaluatePointCloudAStar(const SceneData& data, const TopmapConfig&
   std::reverse(path.begin(), path.end());
   if (path.size() == 1u) path.push_back(path.front());
 
-  outcome.found_path = true;
-  outcome.path_length = PathLength(path);
-  outcome.min_clearance =
-      SafetyValidator()
-          .validate(path, data.mesh, config.traversability, config.robot, config.plan.check_step)
-          .min_clearance;
+  // T34: post-process the raw vertex chain on the full placeable-mesh corridor
+  // before validation, exactly like the hierarchical method. A geometric
+  // post-processing failure is surfaced as kPathOptimizationFailed (605); an
+  // optimized path that still fails validation is kPathValidationFailed (606).
+  const Corridor corridor = FullMeshCorridor(data.mesh, config.traversability);
+  auto optimized = PathOptimizer().optimize(path, data.mesh, corridor, config.plan, config.robot,
+                                            config.traversability);
+  outcome.planning_time_sec = SecondsBetween(begin, Clock::now());
+  if (!optimized.ok()) {
+    outcome.status = optimized.status();
+    return outcome;
+  }
+  const std::vector<Eigen::Vector3f>& final_path = optimized.value();
+  outcome.path_length = PathLength(final_path);
+  const PathValidationReport report =
+      SafetyValidator().validate(final_path, data.mesh, config.traversability, config.robot,
+                                 config.plan.check_step);
+  outcome.min_clearance = report.min_clearance;
+  if (!report.valid) {
+    outcome.status = Status::Error(ErrorCode::kPathValidationFailed,
+                                   "point-cloud path failed the SafetyValidator re-check");
+    return outcome;
+  }
   const std::vector<PortalId> expected =
       ExpectedPortalOrder(data.mesh, data.graph, data.start, data.goal, config);
   outcome.portal_order_valid =
-      SafetyValidator::portalOrderMatches(path, data.mesh, data.graph, expected);
+      SafetyValidator::portalOrderMatches(final_path, data.mesh, data.graph, expected);
+  outcome.found_path = true;
   outcome.status = Status::Ok();
   return outcome;
 }
 
 MethodOutcome EvaluateMeshAStar(const SceneData& data, const TopmapConfig& config) {
   MethodOutcome outcome;
-  Corridor corridor;
-  corridor.triangles.reserve(data.mesh.size());
-  for (TriangleId id = 0; id < static_cast<TriangleId>(data.mesh.size()); ++id) {
-    if (TraversabilityEvaluator::isRobotPlaceable(data.mesh.triangle(id),
-                                                  config.traversability)) {
-      corridor.triangles.push_back(id);
-    }
-  }
+  Corridor corridor = FullMeshCorridor(data.mesh, config.traversability);
   for (const SurfaceRegion& region : data.graph.regions()) {
     corridor.regions.push_back(region.id);
   }
@@ -494,22 +571,36 @@ MethodOutcome EvaluateMeshAStar(const SceneData& data, const TopmapConfig& confi
   const Clock::time_point begin = Clock::now();
   auto result = SurfaceAStar().search(data.mesh, corridor, waypoints, config.traversability,
                                       &outcome.expanded_nodes);
-  outcome.planning_time_sec = SecondsBetween(begin, Clock::now());
   if (!result.ok()) {
+    outcome.planning_time_sec = SecondsBetween(begin, Clock::now());
     outcome.status = result.status();
     return outcome;
   }
   const std::vector<Eigen::Vector3f>& path = result.value();
-  outcome.found_path = true;
-  outcome.path_length = PathLength(path);
-  outcome.min_clearance =
-      SafetyValidator()
-          .validate(path, data.mesh, config.traversability, config.robot, config.plan.check_step)
-          .min_clearance;
+
+  auto optimized = PathOptimizer().optimize(path, data.mesh, corridor, config.plan, config.robot,
+                                            config.traversability);
+  outcome.planning_time_sec = SecondsBetween(begin, Clock::now());
+  if (!optimized.ok()) {
+    outcome.status = optimized.status();
+    return outcome;
+  }
+  const std::vector<Eigen::Vector3f>& final_path = optimized.value();
+  outcome.path_length = PathLength(final_path);
+  const PathValidationReport report =
+      SafetyValidator().validate(final_path, data.mesh, config.traversability, config.robot,
+                                 config.plan.check_step);
+  outcome.min_clearance = report.min_clearance;
+  if (!report.valid) {
+    outcome.status = Status::Error(ErrorCode::kPathValidationFailed,
+                                   "mesh path failed the SafetyValidator re-check");
+    return outcome;
+  }
   const std::vector<PortalId> expected =
       ExpectedPortalOrder(data.mesh, data.graph, data.start, data.goal, config);
   outcome.portal_order_valid =
-      SafetyValidator::portalOrderMatches(path, data.mesh, data.graph, expected);
+      SafetyValidator::portalOrderMatches(final_path, data.mesh, data.graph, expected);
+  outcome.found_path = true;
   outcome.status = Status::Ok();
   return outcome;
 }
@@ -530,8 +621,10 @@ MethodOutcome EvaluateHierarchical(const SceneData& data, const TopmapConfig& co
   }
   const PlanResult& plan = result.value();
   outcome.found_path = true;
-  outcome.expanded_nodes =
-      plan.stats.topology_expanded_nodes + plan.stats.surface_expanded_nodes;
+  // A-05 compares Method C's corridor Surface A* with Method B's full-mesh
+  // Surface A*. Keep the metric in that shared graph domain; topology-search
+  // expansions remain available separately in PlanStats.
+  outcome.expanded_nodes = plan.stats.surface_expanded_nodes;
   outcome.path_length = plan.stats.path_length;
   outcome.min_clearance = plan.stats.min_clearance;
   outcome.portal_order_valid =
@@ -549,7 +642,7 @@ BenchmarkRecord MakeRecord(SyntheticScene scene, PlanningMethod method, const Sc
   record.triangle_count = static_cast<int>(data.mesh.size());
   record.region_count = static_cast<int>(data.graph.regions().size());
   record.portal_count = static_cast<int>(data.graph.portals().size());
-  record.invalid_cross_layer_edges = CountInvalidCrossLayerEdges(data.graph);
+  record.invalid_cross_layer_edges = CountInvalidCrossLayerEdges(data.graph, config.traversability);
   record.reachability_preserved = data.reachability_preserved;
   record.regions_before_compression = data.compression.regions_before;
   record.regions_after_compression = data.compression.regions_after;
@@ -577,7 +670,7 @@ BenchmarkRecord MakeRecord(SyntheticScene scene, PlanningMethod method, const Sc
   if (record.expected_unreachable) {
     // R31: success means "correctly reported no path". Method C must reject the
     // scene in the topology stage; the geometric methods have their own genuine
-    // no-path codes, which are kept verbatim.
+    // no-path codes.
     const ErrorCode code = outcome.status.code;
     const bool no_path = !outcome.found_path &&
                          (code == ErrorCode::kTopologyUnreachable ||
@@ -587,6 +680,13 @@ BenchmarkRecord MakeRecord(SyntheticScene scene, PlanningMethod method, const Sc
     record.success =
         no_path && (method != PlanningMethod::kHierarchical ||
                     code == ErrorCode::kTopologyUnreachable);
+    if (record.success) {
+      // T33 result contract: every correctly-rejected unreachable row exposes
+      // the unified planning-stage unreachable code (602), whichever method
+      // produced the genuine no-path verdict. A method that wrongly found a
+      // path keeps its own code and reports success == false.
+      record.error_code = static_cast<int>(ErrorCode::kTopologyUnreachable);
+    }
   } else {
     record.success = outcome.found_path;
   }
@@ -671,6 +771,22 @@ std::string StripCarriageReturn(std::string line) {
 }
 
 }  // namespace
+
+int CountInvalidCrossLayerEdges(const TopologyGraph& graph, const TraversabilityParams& trav) {
+  int count = 0;
+  for (const Portal& portal : graph.portals()) {
+    const SurfaceRegion* a = graph.region(portal.region_a);
+    const SurfaceRegion* b = graph.region(portal.region_b);
+    if (a == nullptr || b == nullptr) continue;
+    const bool disjoint_bands = a->max_z < b->min_z || b->max_z < a->min_z;
+    if (!disjoint_bands) continue;
+    // The Regions occupy separate height bands, so the connection only counts as
+    // a wrong cross-layer edge when the Portal's own crossing step is beyond the
+    // configured robot limit. A continuous ramp join stays at or below it.
+    if (portal.max_step > trav.max_step_height) ++count;
+  }
+  return count;
+}
 
 std::string benchmarkCsvHeader() { return std::string(kCsvHeader); }
 

@@ -287,6 +287,12 @@ Result<PlanResult> HierarchicalPlanner::plan(const TriangleMesh& mesh, const Top
     fallback_used = true;
   }
 
+  if (!SafetyValidator::portalOrderMatches(final_path, mesh, graph,
+                                           topology_path.portals)) {
+    return Status::Error(ErrorCode::kPathValidationFailed,
+                         "safe path does not preserve the topology Portal order");
+  }
+
   // 7. Assemble the result; every PlanStats field describes the returned path.
   PlanResult result;
   result.status = Status::Ok();

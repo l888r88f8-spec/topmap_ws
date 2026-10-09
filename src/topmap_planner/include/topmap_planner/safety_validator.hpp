@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -32,6 +33,20 @@ class SafetyValidator {
   PathValidationReport validate(const std::vector<Eigen::Vector3f>& path, const TriangleMesh& mesh,
                                 const TraversabilityParams& params, const RobotParams& robot,
                                 float check_step) const;
+
+  // T33: batch per-segment safety check used by Method A's graph builder. The
+  // spatial index is built once and reused for every segment, so checking the
+  // whole candidate edge set is O(sum of sampled lengths), never
+  // O(edges * mesh). For each segment the result is true iff every resampled
+  // sample projects to a robot-placeable, front-facing triangle and every
+  // consecutive pair of projections is joined by a traversable shared edge:
+  // exactly the placeability/clearance/step part of validate(), without the
+  // whole-path slope and curvature tests. Invalid arguments (non-positive
+  // check_step, empty mesh, non-finite endpoint, invalid traversability) yield
+  // kInvalidArgument.
+  Result<std::vector<char>> validateSegments(
+      const std::vector<std::pair<Eigen::Vector3f, Eigen::Vector3f>>& segments,
+      const TriangleMesh& mesh, const TraversabilityParams& params, float check_step) const;
 
   // Nearest baked-traversable triangle to `p` by true point-triangle distance.
   // Ties go to the smallest TriangleId. On success `*distance` (when non-null)

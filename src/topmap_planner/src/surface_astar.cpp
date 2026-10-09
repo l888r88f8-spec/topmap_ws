@@ -36,6 +36,17 @@ Status SurfaceFailure(std::string message) {
   return Status::Error(ErrorCode::kSurfaceSearchFailed, std::move(message));
 }
 
+// Bias graph search away from the hard clearance boundary. The multiplier is
+// always >= 1, so the Euclidean heuristic remains admissible. Safety is still
+// enforced independently by isRobotPlaceable; this term only chooses a more
+// useful centerline among otherwise traversable alternatives.
+float ClearanceCostMultiplier(float clearance, const TraversabilityParams& trav) {
+  if (!(trav.required_clearance > 0.0f)) return 1.0f;
+  const float floor = std::max(0.1f * trav.required_clearance, 1e-3f);
+  const float margin = std::max(clearance - trav.required_clearance, floor);
+  return 1.0f + trav.required_clearance / margin;
+}
+
 // R10/R6: every TraversabilityParams field that the placement and edge checks
 // consume must be finite and non-negative. A negative clearance or a NaN step
 // height silently turns the hard constraint into a no-op (or a no-edge graph),
@@ -163,6 +174,8 @@ struct QueueGreater {
 Result<std::vector<TriangleId>> SearchSegment(const TriangleMesh& mesh,
                                               const std::vector<char>& in_corridor, TriangleId from,
                                               TriangleId to, const TraversabilityParams& trav,
+                                              float heuristic_scale,
+                                              std::vector<char>* expanded_seen,
                                               int* expanded_nodes) {
   const std::size_t count = mesh.size();
   const auto in_bounds = [count](TriangleId id) {
@@ -192,7 +205,8 @@ Result<std::vector<TriangleId>> SearchSegment(const TriangleMesh& mesh,
   std::priority_queue<QueueNode, std::vector<QueueNode>, QueueGreater> open;
 
   const auto heuristic = [&](TriangleId id) {
-    return (mesh.triangle(id).centroid - mesh.triangle(to).centroid).norm();
+    return heuristic_scale *
+           (mesh.triangle(id).centroid - mesh.triangle(to).centroid).norm();
   };
 
   g[static_cast<std::size_t>(from)] = 0.0f;
@@ -203,7 +217,13 @@ Result<std::vector<TriangleId>> SearchSegment(const TriangleMesh& mesh,
     open.pop();
     if (closed[static_cast<std::size_t>(node.id)]) continue;
     closed[static_cast<std::size_t>(node.id)] = 1;
-    if (expanded_nodes != nullptr) ++(*expanded_nodes);
+    if (expanded_nodes != nullptr &&
+        (expanded_seen == nullptr || !(*expanded_seen)[static_cast<std::size_t>(node.id)])) {
+      ++(*expanded_nodes);
+    }
+    if (expanded_seen != nullptr) {
+      (*expanded_seen)[static_cast<std::size_t>(node.id)] = 1;
+    }
     if (node.id == to) break;
 
     const TriangleNode& current = mesh.triangle(node.id);
@@ -217,7 +237,10 @@ Result<std::vector<TriangleId>> SearchSegment(const TriangleMesh& mesh,
       if (!TraversabilityEvaluator::isRobotPlaceable(next, trav)) continue;
       if (!TraversabilityEvaluator::isEdgeTraversable(current, next, trav)) continue;
 
-      const float step = (current.centroid - next.centroid).norm();
+      const float geometric_step = (current.centroid - next.centroid).norm();
+      const float clearance = std::min(current.min_clearance, next.min_clearance);
+      const float step =
+          geometric_step * ClearanceCostMultiplier(clearance, trav);
       // A non-finite edge cost must never enter the queue: NaN comparisons make
       // the relaxation and the queue order undefined.
       if (!std::isfinite(step)) continue;
@@ -281,6 +304,15 @@ Result<std::vector<Eigen::Vector3f>> SurfaceAStar::search(
   }
   if (valid_triangles == 0u) return SurfaceFailure("corridor has no valid triangles");
 
+  float heuristic_scale = kInf;
+  for (const TriangleId id : corridor.triangles) {
+    const TriangleNode& triangle = mesh.triangle(id);
+    if (!TraversabilityEvaluator::isRobotPlaceable(triangle, trav)) continue;
+    heuristic_scale =
+        std::min(heuristic_scale, ClearanceCostMultiplier(triangle.min_clearance, trav));
+  }
+  if (!IsFinite(heuristic_scale) || heuristic_scale < 1.0f) heuristic_scale = 1.0f;
+
   // Map every waypoint before searching so a bad waypoint fails fast and
   // deterministically.
   //
@@ -305,8 +337,13 @@ Result<std::vector<Eigen::Vector3f>> SurfaceAStar::search(
   }
 
   std::vector<Eigen::Vector3f> path;
+  // A hierarchical request searches one segment per ordered Portal. Count a
+  // triangle once for the whole request so expanded_nodes measures unique
+  // search work rather than charging the same node again at every waypoint.
+  std::vector<char> expanded_seen(mesh.size(), 0);
   for (std::size_t i = 0; i + 1 < waypoints.size(); ++i) {
-    auto segment = SearchSegment(mesh, in_corridor, nodes[i], nodes[i + 1], trav, expanded_nodes);
+    auto segment = SearchSegment(mesh, in_corridor, nodes[i], nodes[i + 1], trav, heuristic_scale,
+                                 &expanded_seen, expanded_nodes);
     if (!segment.ok()) return segment.status();
 
     std::vector<Eigen::Vector3f> segment_points;
