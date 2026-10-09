@@ -30,6 +30,7 @@ add_library(topmap_ros
   src/type_conversions.cpp
   src/marker_builder.cpp
   src/map_builder_node.cpp
+  src/planner_node.cpp
 )
 target_include_directories(topmap_ros PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -68,6 +69,12 @@ add_executable(map_builder_node src/map_builder_main.cpp)
 target_link_libraries(map_builder_node topmap_ros)
 install(TARGETS map_builder_node DESTINATION lib/${PROJECT_NAME})
 
+# T31: the online planner executable. As with the builder, the node class lives
+# in the topmap_ros library so tests link it directly.
+add_executable(planner_node src/planner_main.cpp)
+target_link_libraries(planner_node topmap_ros)
+install(TARGETS planner_node DESTINATION lib/${PROJECT_NAME})
+
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(ament_cmake rclcpp topmap_core topmap_surface topmap_topology
                           topmap_planner topmap_msgs nav_msgs geometry_msgs
@@ -92,6 +99,17 @@ if(BUILD_TESTING)
     # writable $HOME/.ros (CI and sandboxed runs may have neither).
     set_tests_properties(test_map_builder_node PROPERTIES
       ENVIRONMENT "ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_ros_logs")
+  endif()
+  ament_add_gtest(test_planner_node test/test_planner_node.cpp)
+  if(TARGET test_planner_node)
+    target_link_libraries(test_planner_node topmap_ros)
+    target_compile_definitions(test_planner_node PRIVATE
+      TOPMAP_ROS_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    set_tests_properties(test_planner_node PROPERTIES
+      ENVIRONMENT "ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_ros_logs"
+      # Several cases build the ramp archive and run the full hierarchical
+      # planner (Debug build) end to end.
+      TIMEOUT 300)
   endif()
 endif()
 

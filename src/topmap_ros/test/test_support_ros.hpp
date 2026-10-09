@@ -31,6 +31,14 @@
 #include "topmap_core/error.hpp"
 #include "topmap_surface/mesh_types.hpp"
 #include "topmap_surface/synthetic_scene.hpp"
+#include "topmap_surface/traversability.hpp"
+#include "topmap_topology/map_archive.hpp"
+#include "topmap_topology/portal_extractor.hpp"
+#include "topmap_topology/portal_validator.hpp"
+#include "topmap_topology/region_growing.hpp"
+#include "topmap_topology/region_split.hpp"
+#include "topmap_topology/region_types.hpp"
+#include "topmap_topology/topology_graph.hpp"
 
 #ifndef TOPMAP_ROS_TEST_SOURCE_DIR
 #error "TOPMAP_ROS_TEST_SOURCE_DIR must be defined by CMake for the topmap_ros tests"
@@ -123,6 +131,97 @@ inline std::string WriteScenePcd(topmap::SyntheticScene scene, const std::string
   auto mesh = topmap::makeSyntheticMesh(scene);
   if (!mesh.ok()) return {};
   return WritePcd(path, CloudFromMesh(mesh.value())) ? path : std::string{};
+}
+
+inline bool HasCrossRegionSharedEdge(
+    const topmap::TriangleMesh& mesh,
+    const std::vector<topmap::SurfaceRegion>& regions) {
+  std::vector<topmap::RegionId> owner(static_cast<std::size_t>(mesh.size()),
+                                      topmap::kInvalidId);
+  for (const topmap::SurfaceRegion& region : regions) {
+    for (const topmap::TriangleId triangle : region.triangle_ids) {
+      if (triangle >= 0 && triangle < static_cast<topmap::TriangleId>(mesh.size())) {
+        owner[static_cast<std::size_t>(triangle)] = region.id;
+      }
+    }
+  }
+  for (topmap::TriangleId triangle = 0;
+       triangle < static_cast<topmap::TriangleId>(mesh.size()); ++triangle) {
+    if (owner[static_cast<std::size_t>(triangle)] == topmap::kInvalidId) continue;
+    for (const topmap::TriangleEdge& edge : mesh.triangle(triangle).edges) {
+      if (edge.neighbor == topmap::kInvalidId || edge.neighbor < triangle) continue;
+      const topmap::RegionId other = owner[static_cast<std::size_t>(edge.neighbor)];
+      if (other != topmap::kInvalidId &&
+          other != owner[static_cast<std::size_t>(triangle)]) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// T31: builds the frozen ramp scene into a loadable map archive by running the
+// real in-process T12-T20 synthetic pipeline (makeSyntheticMesh ->
+// traversability -> grow -> split -> extract -> validate -> TopologyGraph::build
+// -> saveMapArchive). It mirrors the planner's own test fixture
+// (test_support_plan.hpp) and never shells out.
+//
+// It deliberately does NOT round-trip the vertices through PCL: re-triangulating
+// the frozen lattice in the PCD ingress yields long edges and non-zero
+// roughness/curvature, which mark nearly every edge non-traversable and make the
+// ramp unplannable. The map builder's PCD path is covered by
+// test_map_builder_node.cpp; this fixture provides the topology the planner is
+// specified against. Returns the archive path on success, "" on any failure.
+inline std::string BuildRampArchive(const std::string& archive_path) {
+  const auto config = topmap::loadTopmapConfig(validConfigPath());
+  if (!config.ok()) return {};
+
+  auto data = topmap::makeSyntheticMesh(topmap::SyntheticScene::kRamp);
+  if (!data.ok()) return {};
+  auto mesh_result = topmap::TriangleMesh::fromMeshData(data.value(), {});
+  if (!mesh_result.ok()) return {};
+  topmap::TriangleMesh mesh = mesh_result.take();
+  topmap::TraversabilityEvaluator::apply(mesh, config.value().traversability);
+
+  auto grown = topmap::RegionGrower().grow(mesh, config.value().region);
+  if (!grown.ok()) return {};
+  auto split = topmap::RegionSplitter().split(mesh, grown.value(), config.value().region);
+  if (!split.ok()) return {};
+  std::vector<topmap::SurfaceRegion> regions = split.take();
+
+  std::vector<topmap::Portal> portals;
+  auto extracted = topmap::PortalExtractor().extract(mesh, regions, config.value().portal);
+  if (extracted.ok()) {
+    portals = extracted.take();
+  } else if (extracted.status().code != topmap::ErrorCode::kPortalExtractionFailed ||
+             HasCrossRegionSharedEdge(mesh, regions)) {
+    return {};
+  }
+  if (!portals.empty()) {
+    auto validated = topmap::PortalValidator().validate(mesh, regions, portals, config.value().robot,
+                                                        config.value().portal);
+    if (!validated.ok()) return {};
+    portals = validated.take();
+  }
+
+  auto graph = topmap::TopologyGraph::build(regions, portals);
+  if (!graph.ok()) return {};
+
+  topmap::MapArchive archive;
+  archive.format_version = topmap::kTopmapFormatVersion;
+  archive.metadata.frame_id = "map";
+  archive.metadata.robot = config.value().robot;
+  archive.metadata.map = config.value().map;
+  archive.metadata.point_count = static_cast<std::uint32_t>(mesh.vertices().size());
+  archive.metadata.triangle_count = static_cast<std::uint32_t>(mesh.size());
+  archive.metadata.region_count = static_cast<std::uint32_t>(graph.value().regions().size());
+  archive.metadata.portal_count = static_cast<std::uint32_t>(graph.value().portals().size());
+  archive.metadata.connected_components =
+      static_cast<std::uint32_t>(graph.value().connectedComponents());
+  archive.metadata.regions_before_compression = archive.metadata.region_count;
+  archive.mesh = std::move(mesh);
+  archive.graph = graph.take();
+  return topmap::saveMapArchive(archive_path, archive).ok() ? archive_path : std::string{};
 }
 
 // A syntactically valid PCD holding a single NaN point. PCL's writer refuses a
