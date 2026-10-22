@@ -74,6 +74,11 @@ struct CompressionParams {
 
 struct PlanParams {
   float max_project_radius = 0.30f;
+  // Strict adherence of the *returned* path to the traversable surface. This is
+  // deliberately independent of max_project_radius, which is only the endpoint /
+  // waypoint localization search radius. Every interior sample of every emitted
+  // segment must lie within this distance of the real mesh.
+  float path_surface_tolerance = 0.005f;
   float max_project_normal_diff_deg = 45.0f;  // R6: normal consistency on projection
   int corridor_expansion_rings = 1;
   bool fallback_full_mesh = true;   bool shortcut_enabled = true;

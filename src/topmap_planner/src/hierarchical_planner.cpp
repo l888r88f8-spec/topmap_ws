@@ -61,6 +61,9 @@ Status ValidateRequestConfig(const TriangleMesh& mesh, const TopologyGraph& grap
   if (!IsFinite(plan.max_project_radius) || !(plan.max_project_radius > 0.0f)) {
     return Invalid("plan.max_project_radius must be finite and positive");
   }
+  if (!IsFinite(plan.path_surface_tolerance) || !(plan.path_surface_tolerance > 0.0f)) {
+    return Invalid("plan.path_surface_tolerance must be finite and positive");
+  }
   if (!IsFinite(plan.max_project_normal_diff_deg) ||
       plan.max_project_normal_diff_deg < 0.0f) {
     return Invalid("plan.max_project_normal_diff_deg must be finite and non-negative");
@@ -260,8 +263,9 @@ Result<PlanResult> HierarchicalPlanner::plan(const TriangleMesh& mesh, const Top
   const SafetyValidator validator;
   const std::vector<Eigen::Vector3f>& candidate =
       optimization_succeeded ? optimized_path : raw_path;
-  PathValidationReport report = validator.validate(candidate, mesh, config_.traversability,
-                                                   config_.robot, config_.plan.check_step);
+  PathValidationReport report =
+      validator.validate(candidate, mesh, config_.traversability, config_.robot,
+                         config_.plan.check_step, config_.plan.path_surface_tolerance);
   std::vector<Eigen::Vector3f> final_path = candidate;
   if (!report.valid) {
     if (!optimization_succeeded) {
@@ -270,7 +274,7 @@ Result<PlanResult> HierarchicalPlanner::plan(const TriangleMesh& mesh, const Top
     }
     const PathValidationReport raw_report =
         validator.validate(raw_path, mesh, config_.traversability, config_.robot,
-                           config_.plan.check_step);
+                           config_.plan.check_step, config_.plan.path_surface_tolerance);
     if (!raw_report.valid) {
       return Status::Error(ErrorCode::kPathValidationFailed,
                            "optimized and raw paths both failed safety validation "

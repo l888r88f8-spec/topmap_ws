@@ -347,6 +347,63 @@ TEST(SafetyValidatorTest, ValidateRejectsInvalidInputs) {
   RobotParams bad_robot;
   bad_robot.max_path_curvature = 0.0f;
   EXPECT_FALSE(validator.validate(good, prepared.mesh, trav, bad_robot, 0.05f).valid);
+
+  // The final-output adherence tolerance is validated like every other numeric
+  // contract, independently of check_step.
+  EXPECT_FALSE(validator.validate(good, prepared.mesh, trav, robot, 0.05f, 0.0f).valid);
+  EXPECT_FALSE(validator.validate(good, prepared.mesh, trav, robot, 0.05f, -0.01f).valid);
+  EXPECT_FALSE(validator.validate(good, prepared.mesh, trav, robot, 0.05f, nan).valid);
+}
+
+// Every sample of every returned segment must be within the strict final-output
+// tolerance of the real mesh. A sparse chord across the flat/ramp crease can
+// stay within the 0.30 m endpoint localization radius while floating ~0.27 m
+// above the ground, so the validator must reject it rather than trusting the
+// two on-surface endpoints.
+TEST(SafetyValidatorTest, ValidateRejectsFloatingRampChord) {
+  const topmap::test::Prepared prepared = BuildScene(topmap::SyntheticScene::kRamp);
+  const auto ground_z = [](float x) {
+    if (x <= 4.0f) return 0.0f;
+    if (x >= 13.4f) return 2.0f;
+    return 2.0f * (x - 4.0f) / 9.4f;
+  };
+  const Eigen::Vector3f start(2.0f, 2.0f, ground_z(2.0f));
+  const Eigen::Vector3f end(7.4f, 2.0f, ground_z(7.4f));
+  const std::vector<Eigen::Vector3f> floating = {start, end};
+
+  // Both endpoints are on the surface, so this is not the gross off-surface
+  // case; the violation is the floating chord interior.
+  const auto report = SafetyValidator().validate(floating, prepared.mesh, TraversabilityParams{},
+                                                 RobotParams{}, 0.05f);
+  EXPECT_FALSE(report.valid);
+  EXPECT_FALSE(report.violating_indices.empty());
+}
+
+// A genuinely ground-hugging path over the same flat -> ramp -> upper-platform
+// transition must pass. The 3D pitch change is not steering (yaw) curvature, so
+// the strict adherence check must not make a real ramp infeasible.
+TEST(SafetyValidatorTest, ValidateAcceptsGroundHuggingRampPath) {
+  const topmap::test::Prepared prepared = BuildScene(topmap::SyntheticScene::kRamp);
+  const auto ground_z = [](float x) {
+    if (x <= 4.0f) return 0.0f;
+    if (x >= 13.4f) return 2.0f;
+    return 2.0f * (x - 4.0f) / 9.4f;
+  };
+  std::vector<Eigen::Vector3f> path;
+  for (float x = 2.0f; x <= 15.4f + 1e-4f; x += 0.05f) {
+    path.emplace_back(x, 2.0f, ground_z(x));
+  }
+  ASSERT_GE(path.size(), 2u);
+
+  RobotParams robot;
+  const auto report = SafetyValidator().validate(path, prepared.mesh, TraversabilityParams{},
+                                                 robot, 0.05f);
+  EXPECT_TRUE(report.valid) << "violations=" << report.violating_indices.size();
+  EXPECT_GE(report.max_step, 0.0f);
+  EXPECT_LE(report.max_slope_deg, robot.max_slope_deg + 1e-3f);
+  // The flat/ramp/upper-platform creases are pitch changes, not left/right
+  // steering, so the yaw curvature stays essentially zero.
+  EXPECT_LE(report.max_curvature, 0.05f);
 }
 
 // A safe path fills every statistic and leaves no violation.

@@ -69,6 +69,9 @@ Status ValidatePlanParams(const PlanParams& params) {
   if (!IsFinite(params.max_project_radius) || !(params.max_project_radius > 0.0f)) {
     return Invalid("plan.max_project_radius must be finite and positive");
   }
+  if (!IsFinite(params.path_surface_tolerance) || !(params.path_surface_tolerance > 0.0f)) {
+    return Invalid("plan.path_surface_tolerance must be finite and positive");
+  }
   if (params.smoothing_iterations < 0) {
     return Invalid("plan.smoothing_iterations must be non-negative");
   }
@@ -119,6 +122,10 @@ struct SafetyContext {
   float check_step = 0.05f;
   float project_tolerance = 0.30f;
   const class MeshGrid* grid = nullptr;
+  // Radius used only to resolve shared-vertex/fan ambiguity between two samples
+  // whose own nearest triangles are already within project_tolerance. Never used
+  // to accept a sample that is farther than project_tolerance from the surface.
+  float connect_tolerance = 0.30f;
 };
 
 float TriangleDistance(const TriangleMesh& mesh, TriangleId id, const Eigen::Vector3f& p) {
@@ -128,14 +135,65 @@ float TriangleDistance(const TriangleMesh& mesh, TriangleId id, const Eigen::Vec
                                mesh.vertices()[triangle.vertex_ids[2]]);
 }
 
+// Per-axis XY AABB expansion required by ContainsXy's relative edge epsilon.
+//
+// ContainsXy accepts the union of two barycentric half-space branches:
+//   { lambda_i >= -delta } and { lambda_i <= +delta },
+// where delta = epsilon / |2*area| and epsilon = 1e-6 * max(1, |2*area|). The
+// old epsilon / min_edge bound ignored the fact that a point can be accepted
+// just beyond a very acute vertex while staying within epsilon of both incident
+// edge lines; for a wedge with width W that overhang is up to 2*delta*W.
+// The same bound covers both branches: the second branch is only non-empty when
+// |2*area| <= 3*epsilon (delta >= 1/3), and its accepted points also stay within
+// 2*delta*W of the AABB. This is deliberately conservative and proven from the
+// barycentric constraints, not from the shortest edge.
+struct XyMargin {
+  float x = 0.0f;
+  float y = 0.0f;
+  bool pathological = false;
+};
+
+XyMargin XyContainmentMargin(const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+                             const Eigen::Vector3f& c) {
+  const Eigen::Vector2d a2(a.x(), a.y());
+  const Eigen::Vector2d b2(b.x(), b.y());
+  const Eigen::Vector2d c2(c.x(), c.y());
+  const double area2 = (b2 - a2).x() * (c2 - a2).y() - (b2 - a2).y() * (c2 - a2).x();
+  if (!std::isfinite(area2) || std::fabs(area2) <= 1e-12) return XyMargin{};
+  const double epsilon = 1e-6 * std::max(1.0, std::fabs(area2));
+  const double delta = epsilon / std::fabs(area2);
+  const double width_x = std::max(a2.x(), std::max(b2.x(), c2.x())) -
+                         std::min(a2.x(), std::min(b2.x(), c2.x()));
+  const double width_y = std::max(a2.y(), std::max(b2.y(), c2.y())) -
+                         std::min(a2.y(), std::min(b2.y(), c2.y()));
+  // Small slack absorbs float rounding when converting the expanded AABB back
+  // to integer cell coordinates.
+  const double margin_x = 2.0 * delta * width_x + 1e-6;
+  const double margin_y = 2.0 * delta * width_y + 1e-6;
+  XyMargin margin;
+  if (!std::isfinite(margin_x) || !std::isfinite(margin_y) || margin_x > 1e30 ||
+      margin_y > 1e30) {
+    // A near-degenerate triangle can make the proven bound unbounded. The grid
+    // then falls back to a complete per-query scan instead of allocating an
+    // enormous cell range or silently dropping the triangle.
+    margin.pathological = true;
+    return margin;
+  }
+  margin.x = static_cast<float>(margin_x);
+  margin.y = static_cast<float>(margin_y);
+  return margin;
+}
+
 // XY uniform grid over the allowed triangles, shared by every sample of a call.
 // The cell size is the median triangle edge length of the indexed set, so it is
 // derived from the mesh resolution rather than any scene constant. Each triangle
-// is registered in every cell its XY AABB overlaps; a point query then visits
-// its own cell plus a ring of neighbours wide enough that any triangle within
-// `project_tolerance` of the point lies in a visited cell. The nearest candidate
-// is chosen by the true 3D point-triangle distance, so the result is identical to
-// a full scan (smallest id wins exact ties).
+// is registered in every cell its exact XY AABB overlaps; a nearest query then
+// visits its own cell plus a ring of neighbours wide enough that any triangle
+// within `project_tolerance` of the point lies in a visited cell. The nearest
+// candidate is chosen by the true 3D point-triangle distance, so the result is
+// identical to a full scan (smallest id wins exact ties). XY containment queries
+// additionally inspect the 3x3 neighborhood for ContainsXy's small exterior
+// epsilon, with larger-margin triangles kept in a separate overflow list.
 class MeshGrid {
  public:
   bool Build(const TriangleMesh& mesh, const std::vector<char>& allowed, float tolerance) {
@@ -146,6 +204,7 @@ class MeshGrid {
     // that the validator would never see.
     (void)allowed;
     mesh_ = &mesh;
+    full_scan_ = false;
     cell_size_ = 0.0f;
     origin_.setZero();
     nx_ = 0;
@@ -153,6 +212,7 @@ class MeshGrid {
     rings_ = 1;
     entries_.clear();
     cell_begin_.clear();
+    xy_overflow_.clear();
 
     // Median edge length over the whole mesh; an empty mesh yields an empty grid
     // and every projection fails exactly like a full scan.
@@ -202,10 +262,18 @@ class MeshGrid {
     if (nx_ < 1) nx_ = 1;
     if (ny_ < 1) ny_ = 1;
 
-    // Rasterise each triangle's XY AABB into its covering cell range.
+    // Rasterise each triangle's exact XY AABB into its covering cell range for
+    // nearest-point queries. The registration count is bounded before allocating
+    // anything; a pathological exact AABB (a single face spanning a huge number
+    // of cells) switches the whole grid to a complete per-query scan rather than
+    // exhausting memory or dropping a triangle.
     struct Range {
       int ix0 = 0, ix1 = 0, iy0 = 0, iy1 = 0;
     };
+    const std::size_t registration_limit =
+        std::max<std::size_t>(64u * indexed, 1u << 20);
+    double registrations = 0.0;
+    bool full_scan = false;
     std::vector<Range> ranges(mesh.size());
     for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
       const TriangleNode& t = mesh.triangle(id);
@@ -221,6 +289,31 @@ class MeshGrid {
       r.ix1 = CellX(tri_max_x);
       r.iy0 = CellY(tri_min_y);
       r.iy1 = CellY(tri_max_y);
+      registrations +=
+          static_cast<double>(r.ix1 - r.ix0 + 1) * static_cast<double>(r.iy1 - r.iy0 + 1);
+      if (registrations > static_cast<double>(registration_limit)) {
+        full_scan = true;
+        break;
+      }
+      // ContainsXy may accept points just outside the exact XY AABB. The proven
+      // margin is normally at most one cell, so ForEachCandidateAtXy can find
+      // those triangles by querying the 3x3 cell neighborhood. Only triangles
+      // whose proven margin is larger (or unbounded) need the small overflow
+      // list; they stay registered by their exact AABB for nearest queries.
+      const XyMargin margin = XyContainmentMargin(a, b, c);
+      if (margin.pathological || margin.x > cell_size_ || margin.y > cell_size_) {
+        xy_overflow_.push_back(id);
+      }
+    }
+    if (full_scan) {
+      full_scan_ = true;
+      cell_size_ = 0.0f;
+      nx_ = 0;
+      ny_ = 0;
+      entries_.clear();
+      cell_begin_.clear();
+      xy_overflow_.clear();
+      return true;
     }
 
     const std::size_t num_cells =
@@ -256,7 +349,9 @@ class MeshGrid {
     return true;
   }
 
-  bool empty() const { return cell_size_ <= 0.0f || nx_ <= 0 || ny_ <= 0; }
+  bool empty() const {
+    return mesh_ == nullptr || (!full_scan_ && (cell_size_ <= 0.0f || nx_ <= 0 || ny_ <= 0));
+  }
 
   // True nearest allowed triangle to `point`; ties go to the smallest id like
   // the ascending-id full scan it replaces. Rings expand outward and stop as
@@ -265,6 +360,21 @@ class MeshGrid {
   // best distance strictly below that bound is already the global nearest.
   bool NearestWithin(const Eigen::Vector3f& point, TriangleId* located, float* distance) const {
     if (empty()) return false;
+    if (full_scan_) {
+      TriangleId best = kInvalidId;
+      float best_distance = kInf;
+      for (TriangleId id = 0; id < static_cast<TriangleId>(mesh_->size()); ++id) {
+        const float d = TriangleDistance(*mesh_, id, point);
+        if (best == kInvalidId || d < best_distance || (d == best_distance && id < best)) {
+          best = id;
+          best_distance = d;
+        }
+      }
+      if (best == kInvalidId) return false;
+      if (located != nullptr) *located = best;
+      if (distance != nullptr) *distance = best_distance;
+      return true;
+    }
     const int cx = CellX(point.x());
     const int cy = CellY(point.y());
     TriangleId best = kInvalidId;
@@ -304,6 +414,45 @@ class MeshGrid {
     return true;
   }
 
+  // Enumerates a complete superset of the triangles ContainsXy can accept at
+  // `point`. Normal triangles are indexed by their exact XY AABB; because their
+  // proven containment margin is at most one cell, the 3x3 cell neighborhood
+  // around the query is sufficient. Triangles with a larger or pathological
+  // margin are always tested from the small overflow list. IDs are collected,
+  // sorted and de-duplicated so the caller sees the same ascending-id order as
+  // the full scan this replaces.
+  template <typename Visitor>
+  void ForEachCandidateAtXy(const Eigen::Vector3f& point, Visitor&& visitor) const {
+    if (empty()) return;
+    if (full_scan_) {
+      for (TriangleId id = 0; id < static_cast<TriangleId>(mesh_->size()); ++id) {
+        visitor(id);
+      }
+      return;
+    }
+    std::vector<TriangleId> candidates;
+    candidates.reserve(xy_overflow_.size() + 32u);
+    const int cx = CellX(point.x());
+    const int cy = CellY(point.y());
+    for (int dy = -1; dy <= 1; ++dy) {
+      const int y = cy + dy;
+      if (y < 0 || y >= ny_) continue;
+      const std::size_t row = static_cast<std::size_t>(y) * static_cast<std::size_t>(nx_);
+      for (int dx = -1; dx <= 1; ++dx) {
+        const int x = cx + dx;
+        if (x < 0 || x >= nx_) continue;
+        const std::size_t c = row + static_cast<std::size_t>(x);
+        for (int k = cell_begin_[c]; k < cell_begin_[c + 1u]; ++k) {
+          candidates.push_back(entries_[static_cast<std::size_t>(k)]);
+        }
+      }
+    }
+    candidates.insert(candidates.end(), xy_overflow_.begin(), xy_overflow_.end());
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    for (const TriangleId id : candidates) visitor(id);
+  }
+
  private:
   int CellX(float x) const {
     if (!(x > -kInf)) return 0;  // NaN guard; callers validate finiteness.
@@ -321,6 +470,7 @@ class MeshGrid {
   }
 
   const TriangleMesh* mesh_ = nullptr;
+  bool full_scan_ = false;
   float cell_size_ = 0.0f;
   Eigen::Vector2f origin_ = Eigen::Vector2f::Zero();
   int nx_ = 0;
@@ -328,6 +478,10 @@ class MeshGrid {
   int rings_ = 1;
   std::vector<TriangleId> entries_;  // CSR payload
   std::vector<int> cell_begin_;      // CSR offsets, size nx*ny + 1
+  // Triangles whose proven XY containment margin exceeds one cell. They remain
+  // in the exact-AABB nearest index above and are additionally tested for every
+  // XY containment query.
+  std::vector<TriangleId> xy_overflow_;
 };
 
 bool SharesTraversableEdge(const TriangleMesh& mesh, const TraversabilityParams& trav,
@@ -365,7 +519,7 @@ bool ConnectedNearPoint(const SafetyContext& ctx, TriangleId a, TriangleId b,
       if (!TraversabilityEvaluator::isRobotPlaceable(next_triangle, trav) ||
           !TraversabilityEvaluator::isEdgeTraversable(mesh.triangle(current), next_triangle,
                                                       trav) ||
-          TriangleDistance(mesh, next, point) > ctx.project_tolerance) {
+          TriangleDistance(mesh, next, point) > ctx.connect_tolerance) {
         continue;
       }
       if (next == b) return true;
@@ -434,7 +588,7 @@ bool LocatePlaceable(const SafetyContext& ctx, const Eigen::Vector3f& point,
     if (id == kInvalidId || !(*ctx.allowed)[static_cast<std::size_t>(id)]) continue;
     if (!TraversabilityEvaluator::isRobotPlaceable(ctx.mesh->triangle(id), *ctx.trav)) continue;
     const float distance = TriangleDistance(*ctx.mesh, id, point);
-    if (!std::isfinite(distance) || distance > ctx.project_tolerance) continue;
+    if (!std::isfinite(distance) || distance > ctx.connect_tolerance) continue;
     if (connected == kInvalidId || distance < connected_distance) {
       connected = id;
       connected_distance = distance;
@@ -468,15 +622,23 @@ bool SegmentSafe(const SafetyContext& ctx, const Eigen::Vector3f& a,
   return true;
 }
 
-// kappa = 2*sin(angle at B)/|AC| == 2*|BA x BC| / (|BA|*|BC|*|AC|).
+// Ground-steering curvature: the yaw curvature the vehicle actually has to
+// steer, measured in the XY travel plane. Following a real mesh crease produces
+// a 3D pitch corner (flat <-> ramp) that must not be reported as a steering
+// violation. A genuine left/right turn still has the same 2*sin(angle)/|AC|
+// value as the 3D formula because both triangles are horizontal projections of
+// the incident headings. A purely vertical segment has no steering direction and
+// contributes zero.
 float CurvatureAt(const Eigen::Vector3f& a, const Eigen::Vector3f& b,
                   const Eigen::Vector3f& c) {
-  const Eigen::Vector3f ba = a - b, bc = c - b;
-  const float lab = ba.norm(), lbc = bc.norm(), lac = (c - a).norm();
+  const Eigen::Vector2f ba(a.x() - b.x(), a.y() - b.y());
+  const Eigen::Vector2f bc(c.x() - b.x(), c.y() - b.y());
+  const Eigen::Vector2f ca(c.x() - a.x(), c.y() - a.y());
+  const float lab = ba.norm(), lbc = bc.norm(), lac = ca.norm();
   if (lab <= kDuplicateEpsilon || lbc <= kDuplicateEpsilon || lac <= kDuplicateEpsilon) {
     return 0.0f;
   }
-  return 2.0f * ba.cross(bc).norm() / (lab * lbc * lac);
+  return 2.0f * std::fabs(ba.x() * bc.y() - ba.y() * bc.x()) / (lab * lbc * lac);
 }
 
 float MaxCurvature(const std::vector<Eigen::Vector3f>& points) {
@@ -493,8 +655,20 @@ float MaxCurvature(const std::vector<Eigen::Vector3f>& points) {
 // makes its curvature final, so later choices cannot invalidate it.
 std::vector<Eigen::Vector3f> CurvatureAwareShortcut(
     const std::vector<Eigen::Vector3f>& points, const SafetyContext& ctx,
-    float max_curvature) {
+    float max_curvature, const std::vector<char>* mandatory = nullptr) {
   if (points.size() < 2u) return points;
+  // Prefix counts make the "does this chord skip a mandatory crease?" test O(1)
+  // instead of rescanning every interior index for every candidate j. When no
+  // mandatory mask is supplied, the test is skipped entirely.
+  std::vector<std::size_t> mandatory_prefix;
+  if (mandatory != nullptr) {
+    mandatory_prefix.resize(points.size() + 1u, 0u);
+    for (std::size_t k = 0; k < points.size(); ++k) {
+      mandatory_prefix[k + 1u] =
+          mandatory_prefix[k] +
+          ((k < mandatory->size() && (*mandatory)[k] != 0) ? 1u : 0u);
+    }
+  }
   std::vector<Eigen::Vector3f> out;
   out.reserve(points.size());
   out.push_back(points.front());
@@ -503,6 +677,13 @@ std::vector<Eigen::Vector3f> CurvatureAwareShortcut(
     std::size_t selected = i + 1u;
     bool found = false;
     for (std::size_t j = points.size() - 1u; j > i; --j) {
+      // A shortcut may never skip a mandatory terrain crease. The crease point
+      // itself may be a destination, so only indices strictly between i and j
+      // are checked. Prefix counts answer that in O(1).
+      if (!mandatory_prefix.empty() &&
+          mandatory_prefix[j] > mandatory_prefix[i + 1u]) {
+        continue;
+      }
       if (!SegmentSafe(ctx, points[i], points[j])) continue;
       if (out.size() >= 2u &&
           CurvatureAt(out[out.size() - 2u], points[i], points[j]) > max_curvature) {
@@ -696,6 +877,453 @@ bool BuildAllowed(const TriangleMesh& mesh, const Corridor& corridor,
   return true;
 }
 
+float Cross2d(const Eigen::Vector2f& a, const Eigen::Vector2f& b) {
+  return a.x() * b.y() - a.y() * b.x();
+}
+
+// True when the XY projection of `p` lies inside triangle (a,b,c). The small
+// relative epsilon only absorbs float round-off at shared edges; it is not a
+// lateral snapping tolerance, so a sample over a hole is never accepted.
+bool ContainsXy(const Eigen::Vector3f& p, const Eigen::Vector3f& a, const Eigen::Vector3f& b,
+                const Eigen::Vector3f& c) {
+  const Eigen::Vector2f p2(p.x(), p.y());
+  const Eigen::Vector2f a2(a.x(), a.y());
+  const Eigen::Vector2f b2(b.x(), b.y());
+  const Eigen::Vector2f c2(c.x(), c.y());
+  const float area = Cross2d(b2 - a2, c2 - a2);
+  if (!IsFinite(area) || std::fabs(area) <= 1e-12f) return false;
+  const float epsilon = 1e-6f * std::max(1.0f, std::fabs(area));
+  const float d1 = Cross2d(b2 - a2, p2 - a2);
+  const float d2 = Cross2d(c2 - b2, p2 - b2);
+  const float d3 = Cross2d(a2 - c2, p2 - c2);
+  const bool outside_negative = d1 < -epsilon || d2 < -epsilon || d3 < -epsilon;
+  const bool outside_positive = d1 > epsilon || d2 > epsilon || d3 > epsilon;
+  return !(outside_negative && outside_positive);
+}
+
+// Vertical projection of `p` onto the plane of triangle (a,b,c): the returned
+// point keeps p.x/p.y exactly and only resolves the surface height. A near-
+// vertical triangle has no single-valued height and is rejected.
+bool VerticalSurfaceZ(const Eigen::Vector3f& p, const Eigen::Vector3f& a,
+                      const Eigen::Vector3f& b, const Eigen::Vector3f& c, float* z) {
+  const Eigen::Vector3f normal = (b - a).cross(c - a);
+  const float nz = normal.z();
+  if (!IsFinite(nz) || std::fabs(nz) <= 1e-9f) return false;
+  const float value = a.z() - (normal.x() * (p.x() - a.x()) + normal.y() * (p.y() - a.y())) / nz;
+  if (!IsFinite(value)) return false;
+  *z = value;
+  return true;
+}
+
+// Locates the surface height at `sample`'s XY inside the allowed corridor. The
+// query never moves laterally, so a chord over a hole cannot be "repaired" by
+// snapping to the nearest boundary triangle. Continuity with `previous` keeps
+// overlapping floors/components from being exchanged: only the same triangle or
+// a traversably edge-adjacent one is accepted.
+bool LocateSurfaceAtXy(const MeshGrid& grid, const TriangleMesh& mesh,
+                       const std::vector<char>& allowed, const TraversabilityParams& trav,
+                       const Eigen::Vector3f& sample, TriangleId previous,
+                       float max_search_radius, TriangleId* located,
+                       Eigen::Vector3f* surface_point, int required_component = -1) {
+  TriangleId best = kInvalidId;
+  float best_distance = kInf;
+  int best_continuity = 3;
+  Eigen::Vector3f best_point = Eigen::Vector3f::Zero();
+  // The grid enumerates a complete superset of the containing triangles; every
+  // acceptance, continuity, distance and tie rule below is unchanged from the
+  // full ascending-id scan it replaces.
+  grid.ForEachCandidateAtXy(sample, [&](const TriangleId id) {
+    if (!allowed[static_cast<std::size_t>(id)]) return;
+    if (required_component >= 0 && mesh.componentId(id) != required_component) return;
+    const TriangleNode& triangle = mesh.triangle(id);
+    if (!TraversabilityEvaluator::isRobotPlaceable(triangle, trav)) return;
+    const Eigen::Vector3f& a = mesh.vertices()[triangle.vertex_ids[0]];
+    const Eigen::Vector3f& b = mesh.vertices()[triangle.vertex_ids[1]];
+    const Eigen::Vector3f& c = mesh.vertices()[triangle.vertex_ids[2]];
+    if (!ContainsXy(sample, a, b, c)) return;
+    if (triangle.normal.dot(sample - triangle.centroid) < -trav.max_step_height) return;
+    float z = 0.0f;
+    if (!VerticalSurfaceZ(sample, a, b, c, &z)) return;
+    const Eigen::Vector3f point(sample.x(), sample.y(), z);
+    if (triangle.normal.dot(point - triangle.centroid) < -trav.max_step_height) return;
+    const float distance = std::fabs(z - sample.z());
+    if (!IsFinite(distance) || distance > max_search_radius) return;
+
+    int continuity = 0;
+    if (previous != kInvalidId) {
+      if (id == previous) {
+        continuity = 0;
+      } else if (SharesTraversableEdge(mesh, trav, previous, id)) {
+        continuity = 1;
+      } else {
+        // A sample can straddle a mesh vertex where the two containing
+        // triangles are separated by a local fan of triangles. Accept that only
+        // when the fan is traversable and sits near the same sample, exactly
+        // like the optimizer's own sample-projection logic. This does not permit
+        // a hole or layer jump because the query XY must still be contained by
+        // the candidate triangle (checked above).
+        const SafetyContext local{&mesh, &allowed, &trav, 0.05f, max_search_radius, nullptr};
+        if (!ConnectedNearPoint(local, previous, id, point)) return;
+        continuity = 2;
+      }
+    }
+    if (best == kInvalidId || continuity < best_continuity ||
+        (continuity == best_continuity &&
+         (distance < best_distance || (distance == best_distance && id < best)))) {
+      best = id;
+      best_continuity = continuity;
+      best_distance = distance;
+      best_point = point;
+    }
+  });
+  if (best == kInvalidId) return false;
+  if (located != nullptr) *located = best;
+  if (surface_point != nullptr) *surface_point = best_point;
+  return true;
+}
+
+// Sampling interval for the surface lift. The bound keeps the chord sag across
+// the steepest allowed slope below path_surface_tolerance; check_step is never
+// exceeded.
+float SurfaceLiftStep(const PlanParams& params, const TraversabilityParams& trav) {
+  const float slope_tan =
+      std::max(std::tan(std::min(trav.max_slope_rad(), kPiF * 0.5f - 1e-3f)), 1e-3f);
+  const float tolerance_step = 2.0f * params.path_surface_tolerance / slope_tan;
+  float step = std::min(params.check_step, tolerance_step);
+  if (!IsFinite(step) || step < 1e-3f) step = 1e-3f;
+  return step;
+}
+
+// Converts a guide polyline into both the dense per-triangle surface path and
+// the sparse path that keeps only the guide's own lifted vertices. Both outputs
+// need the same sampling sequence and continuity state, so they are collected in
+// one traversal: the dense path is what guarantees strict adherence across a
+// slope change, while the sparse path preserves the caller's guide geometry
+// (including a required Portal transition) whenever its chords are already
+// within tolerance. Sampling, duplicate removal and continuity are byte-for-byte
+// the previous dense and sparse passes, just not repeated.
+bool LiftGuideToSurface(const std::vector<Eigen::Vector3f>& guide, const TriangleMesh& mesh,
+                        const std::vector<char>& allowed, const TraversabilityParams& trav,
+                        const PlanParams& params, const MeshGrid& grid,
+                        std::vector<Eigen::Vector3f>* dense,
+                        std::vector<Eigen::Vector3f>* sparse) {
+  dense->clear();
+  sparse->clear();
+  if (guide.size() < 2u) return false;
+  const float step = SurfaceLiftStep(params, trav);
+  const float duplicate_sq = kDuplicateEpsilon * kDuplicateEpsilon;
+  TriangleId previous = kInvalidId;
+
+  for (std::size_t i = 0; i + 1u < guide.size(); ++i) {
+    const Eigen::Vector3f& a = guide[i];
+    const Eigen::Vector3f& b = guide[i + 1u];
+    const float length = (b - a).norm();
+    if (!IsFinite(length)) return false;
+    int samples = static_cast<int>(std::ceil(length / step));
+    if (samples < 1) samples = 1;
+    const int first = (i == 0u) ? 0 : 1;
+    for (int s = first; s <= samples; ++s) {
+      const float t = static_cast<float>(s) / static_cast<float>(samples);
+      TriangleId located = kInvalidId;
+      Eigen::Vector3f point = Eigen::Vector3f::Zero();
+      if (!LocateSurfaceAtXy(grid, mesh, allowed, trav, a + (b - a) * t, previous,
+                             params.max_project_radius, &located, &point)) {
+        return false;
+      }
+      previous = located;
+      if (dense->empty() || (point - dense->back()).squaredNorm() > duplicate_sq) {
+        dense->push_back(point);
+      }
+      if ((s == samples || (i == 0u && s == 0)) &&
+          (sparse->empty() || (point - sparse->back()).squaredNorm() > duplicate_sq)) {
+        sparse->push_back(point);
+      }
+    }
+  }
+  return dense->size() >= 2u;
+}
+
+// Terrain crease edges are the shared mesh edges whose two adjacent, allowed,
+// placeable triangles have different face planes. The threshold only rejects
+// numerical plane noise and coplanar triangulation diagonals; a real slope
+// transition is orders of magnitude larger.
+constexpr float kCreaseNormalCrossEpsilon = 1e-3f;  // sin(~0.057 deg)
+constexpr double kCreaseParameterEpsilon = 1e-6;
+constexpr std::size_t kMaxCreaseHitsPerSegment = 64u;
+constexpr std::size_t kMaxCreaseCandidatePoints = 2048u;
+
+struct CreaseEdge {
+  Eigen::Vector3f a = Eigen::Vector3f::Zero();
+  Eigen::Vector3f b = Eigen::Vector3f::Zero();
+};
+
+struct CreaseHit {
+  Eigen::Vector3f point = Eigen::Vector3f::Zero();
+  double t = 0.0;
+};
+
+// Collects only edges the candidate may legally cross: both triangles in the
+// corridor, robot-placeable, same component/layer, shared edge traversable, and
+// the two face planes genuinely different. Boundary edges are ignored.
+void CollectCreaseEdges(const TriangleMesh& mesh, const std::vector<char>& allowed,
+                        const TraversabilityParams& trav, int component,
+                        std::vector<CreaseEdge>* edges) {
+  edges->clear();
+  for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
+    if (!allowed[static_cast<std::size_t>(id)]) continue;
+    if (mesh.componentId(id) != component) continue;
+    const TriangleNode& triangle = mesh.triangle(id);
+    if (!TraversabilityEvaluator::isRobotPlaceable(triangle, trav)) continue;
+    for (const TriangleEdge& edge : triangle.edges) {
+      if (edge.neighbor == kInvalidId || edge.neighbor < id) continue;
+      if (edge.neighbor >= static_cast<TriangleId>(allowed.size()) ||
+          !allowed[static_cast<std::size_t>(edge.neighbor)]) {
+        continue;
+      }
+      if (mesh.componentId(edge.neighbor) != component) continue;
+      const TriangleNode& neighbour = mesh.triangle(edge.neighbor);
+      if (!TraversabilityEvaluator::isRobotPlaceable(neighbour, trav)) continue;
+      if (!edge.traversable ||
+          !TraversabilityEvaluator::isEdgeTraversable(triangle, neighbour, trav)) {
+        continue;
+      }
+      if (triangle.normal.cross(neighbour.normal).norm() <= kCreaseNormalCrossEpsilon) {
+        continue;
+      }
+      CreaseEdge crease;
+      crease.a = mesh.vertices()[edge.v0];
+      crease.b = mesh.vertices()[edge.v1];
+      edges->push_back(crease);
+    }
+  }
+}
+
+// Intersects the guide segment's XY projection with one real edge segment. The
+// emitted point is interpolated from the actual mesh edge endpoints, so it lies
+// on the crease to float round-off. A guide that runs along a crease is
+// ambiguous (there is no single crossing); the caller then uses the old dense
+// fallback instead of guessing.
+bool IntersectCrease(const Eigen::Vector3f& from, const Eigen::Vector3f& to,
+                     const CreaseEdge& edge, CreaseHit* hit, bool* ambiguous) {
+  const Eigen::Vector2d p(from.x(), from.y());
+  const Eigen::Vector2d r(to.x() - from.x(), to.y() - from.y());
+  const Eigen::Vector2d e0(edge.a.x(), edge.a.y());
+  const Eigen::Vector2d s(edge.b.x() - edge.a.x(), edge.b.y() - edge.a.y());
+  const double r_length = r.norm();
+  const double s_length = s.norm();
+  if (!(r_length > 0.0) || !(s_length > 0.0)) return false;
+  const double denominator = r.x() * s.y() - r.y() * s.x();
+  const double parallel_epsilon = 1e-12 * std::max(1.0, r_length * s_length);
+  if (!std::isfinite(denominator) || std::fabs(denominator) <= parallel_epsilon) {
+    const Eigen::Vector2d offset = e0 - p;
+    const double line_offset = offset.x() * r.y() - offset.y() * r.x();
+    if (std::fabs(line_offset) <= 1e-6 * std::max(1.0, r_length)) {
+      *ambiguous = true;
+    }
+    return false;
+  }
+  const Eigen::Vector2d offset = e0 - p;
+  const double t = (offset.x() * s.y() - offset.y() * s.x()) / denominator;
+  const double u = (offset.x() * r.y() - offset.y() * r.x()) / denominator;
+  if (t < -kCreaseParameterEpsilon || t > 1.0 + kCreaseParameterEpsilon ||
+      u < -kCreaseParameterEpsilon || u > 1.0 + kCreaseParameterEpsilon) {
+    return false;
+  }
+  const double clamped_t = std::clamp(t, 0.0, 1.0);
+  const double clamped_u = std::clamp(u, 0.0, 1.0);
+  const Eigen::Vector3d a(edge.a.x(), edge.a.y(), edge.a.z());
+  const Eigen::Vector3d b(edge.b.x(), edge.b.y(), edge.b.z());
+  const Eigen::Vector3d point = a + clamped_u * (b - a);
+  if (!point.allFinite()) return false;
+  hit->point = point.cast<float>();
+  hit->t = clamped_t;
+  return true;
+}
+
+// Appends in path order while preserving the exact crease point. If a projected
+// guide vertex is a near-duplicate, the crease point replaces it and stays
+// marked mandatory for later simplification.
+void AppendCandidatePoint(std::vector<Eigen::Vector3f>* points, std::vector<char>* mandatory,
+                          const Eigen::Vector3f& point, bool crease) {
+  if (!points->empty() &&
+      (point - points->back()).squaredNorm() <= kDuplicateEpsilon * kDuplicateEpsilon) {
+    if (crease) {
+      points->back() = point;
+      (*mandatory)[mandatory->size() - 1u] = 1;
+    }
+    return;
+  }
+  points->push_back(point);
+  mandatory->push_back(crease ? 1 : 0);
+}
+
+// Fast candidate: the guide's own surface-projected vertices plus the exact
+// intersections of each guide segment with real terrain crease edges. It never
+// samples triangle interiors or coplanar grid diagonals. Guide vertices are
+// projected within the already-selected component (never across a layer or
+// component); if a projection, crease intersection, or count is ambiguous, the
+// caller keeps the existing dense lift as the fallback rather than dropping the
+// candidate silently.
+bool BuildCreasePreservingPath(const std::vector<Eigen::Vector3f>& guide,
+                               const TriangleMesh& mesh, const std::vector<char>& allowed,
+                               const TraversabilityParams& trav, const PlanParams& params,
+                               const MeshGrid& grid, std::vector<Eigen::Vector3f>* out,
+                               std::vector<char>* mandatory) {
+  out->clear();
+  mandatory->clear();
+  if (guide.size() < 2u) return false;
+
+  TriangleId start_triangle = kInvalidId;
+  Eigen::Vector3f start_point = Eigen::Vector3f::Zero();
+  if (!LocateSurfaceAtXy(grid, mesh, allowed, trav, guide.front(), kInvalidId,
+                         params.max_project_radius, &start_triangle, &start_point)) {
+    return false;
+  }
+  const int component = mesh.componentId(start_triangle);
+  std::vector<CreaseEdge> creases;
+  CollectCreaseEdges(mesh, allowed, trav, component, &creases);
+  AppendCandidatePoint(out, mandatory, start_point, false);
+
+  for (std::size_t i = 0; i + 1u < guide.size(); ++i) {
+    std::vector<CreaseHit> hits;
+    bool ambiguous = false;
+    for (const CreaseEdge& edge : creases) {
+      CreaseHit hit;
+      if (!IntersectCrease(guide[i], guide[i + 1u], edge, &hit, &ambiguous)) continue;
+      hits.push_back(hit);
+      if (hits.size() > kMaxCreaseHitsPerSegment) return false;
+    }
+    if (ambiguous) return false;
+    std::sort(hits.begin(), hits.end(), [](const CreaseHit& lhs, const CreaseHit& rhs) {
+      if (lhs.t != rhs.t) return lhs.t < rhs.t;
+      if (lhs.point.x() != rhs.point.x()) return lhs.point.x() < rhs.point.x();
+      if (lhs.point.y() != rhs.point.y()) return lhs.point.y() < rhs.point.y();
+      return lhs.point.z() < rhs.point.z();
+    });
+
+    TriangleId end_triangle = kInvalidId;
+    Eigen::Vector3f end_point = Eigen::Vector3f::Zero();
+    if (!LocateSurfaceAtXy(grid, mesh, allowed, trav, guide[i + 1u], kInvalidId,
+                           params.max_project_radius, &end_triangle, &end_point,
+                           component)) {
+      return false;
+    }
+    for (const CreaseHit& hit : hits) {
+      AppendCandidatePoint(out, mandatory, hit.point, true);
+    }
+    AppendCandidatePoint(out, mandatory, end_point, false);
+    if (out->size() > kMaxCreaseCandidatePoints) return false;
+  }
+  return out->size() >= 2u && mandatory->size() == out->size();
+}
+
+bool PathSurfaceSafe(const std::vector<Eigen::Vector3f>& path, const SafetyContext& ctx,
+                     float max_curvature) {
+  if (path.size() < 2u) return false;
+  for (std::size_t i = 0; i + 1u < path.size(); ++i) {
+    if (!SegmentSafe(ctx, path[i], path[i + 1u])) return false;
+  }
+  return MaxCurvature(path) <= max_curvature;
+}
+
+// Final production stage: lift the candidate onto the actual corridor mesh and
+// simplify it with the strict surface tolerance, never the 0.30 m endpoint
+// radius. Both the dense lift and the simplified result must pass the complete
+// segment test (interior samples, placeability, traversable transitions) and the
+// ground-steering curvature limit.
+bool BuildSurfaceConstrainedPath(const std::vector<Eigen::Vector3f>& guide,
+                                 const TriangleMesh& mesh, const std::vector<char>& allowed,
+                                 const PlanParams& params, const RobotParams& robot,
+                                 const TraversabilityParams& trav,
+                                 const std::vector<Portal>* ordered_portals,
+                                 std::vector<Eigen::Vector3f>* out) {
+  // One grid serves both the surface lift's XY containment queries and the
+  // strict segment checks below. It is built before the lift so sampling never
+  // falls back to a whole-mesh scan.
+  MeshGrid grid;
+  if (!grid.Build(mesh, allowed, params.path_surface_tolerance)) return false;
+  const float connect_tolerance =
+      std::min(params.max_project_radius, std::max(params.path_surface_tolerance,
+                                                  2.0f * params.check_step));
+  const SafetyContext ctx{&mesh, &allowed, &trav, params.check_step,
+                          params.path_surface_tolerance, &grid, connect_tolerance};
+  const auto portal_order_ok = [ordered_portals](const std::vector<Eigen::Vector3f>& path) {
+    return ordered_portals == nullptr || CrossesPortalSequence(path, *ordered_portals);
+  };
+  // The fast crease candidate is only accepted after the existing strict lift
+  // succeeds on that exact candidate. This keeps the original fine XY
+  // containment/layer coverage and SurfaceLiftStep sampling: an endpoint chord
+  // over a small hole cannot pass merely because both endpoints are on the mesh.
+  const auto lifts_to_surface = [&](const std::vector<Eigen::Vector3f>& candidate) {
+    std::vector<Eigen::Vector3f> temporary_dense;
+    std::vector<Eigen::Vector3f> temporary_sparse;
+    return LiftGuideToSurface(candidate, mesh, allowed, trav, params, grid,
+                              &temporary_dense, &temporary_sparse);
+  };
+
+  // Fast path for the common flat -> ramp -> platform case: project the guide's
+  // own vertices and insert the exact intersections with real terrain crease
+  // edges. Simplification is allowed but can never skip a crease point. If any
+  // part of this candidate is ambiguous or unsafe, fall through to the existing
+  // dense lift unchanged; a candidate is never silently dropped or accepted on
+  // a looser tolerance.
+  std::vector<Eigen::Vector3f> crease_path;
+  std::vector<char> crease_mandatory;
+  if (BuildCreasePreservingPath(guide, mesh, allowed, trav, params, grid, &crease_path,
+                                &crease_mandatory)) {
+    if (params.shortcut_enabled && crease_path.size() > 2u) {
+      std::vector<Eigen::Vector3f> simplified =
+          CurvatureAwareShortcut(crease_path, ctx, robot.max_path_curvature,
+                                 &crease_mandatory);
+      if (lifts_to_surface(simplified) &&
+          PathSurfaceSafe(simplified, ctx, robot.max_path_curvature) &&
+          portal_order_ok(simplified)) {
+        *out = std::move(simplified);
+        return true;
+      }
+    }
+    if (lifts_to_surface(crease_path) &&
+        PathSurfaceSafe(crease_path, ctx, robot.max_path_curvature) &&
+        portal_order_ok(crease_path)) {
+      *out = std::move(crease_path);
+      return true;
+    }
+  }
+
+  std::vector<Eigen::Vector3f> dense;
+  std::vector<Eigen::Vector3f> sparse;
+  if (!LiftGuideToSurface(guide, mesh, allowed, trav, params, grid, &dense, &sparse)) {
+    return false;
+  }
+  const bool sparse_ok = sparse.size() >= 2u;
+  // Prefer the shortest path that passes every strict segment/Portal check.
+  // Shortcutting remains configurable. A sparse lift of the original guide is
+  // preferred over a fully dense lift when its straight segments are already
+  // within tolerance: this keeps a feasible Portal corner without inventing a
+  // sample-dependent curvature violation, while PathSurfaceSafe still checks
+  // every segment interior. The dense path is the fallback for a guide segment
+  // that bridges a slope change or otherwise needs intermediate surface points.
+  if (params.shortcut_enabled) {
+    std::vector<Eigen::Vector3f> simplified =
+        CurvatureAwareShortcut(dense, ctx, robot.max_path_curvature);
+    if (PathSurfaceSafe(simplified, ctx, robot.max_path_curvature) &&
+        portal_order_ok(simplified)) {
+      *out = std::move(simplified);
+      return true;
+    }
+  }
+  if (sparse_ok && PathSurfaceSafe(sparse, ctx, robot.max_path_curvature) &&
+      portal_order_ok(sparse)) {
+    *out = std::move(sparse);
+    return true;
+  }
+  if (PathSurfaceSafe(dense, ctx, robot.max_path_curvature) && portal_order_ok(dense)) {
+    *out = std::move(dense);
+    return true;
+  }
+  return false;
+}
+
 // T25 core shared by both optimize overloads. `ordered_portals == nullptr`
 // means the frozen signature (funnel deterministically skipped).
 Result<std::vector<Eigen::Vector3f>> OptimizeImpl(
@@ -783,32 +1411,64 @@ Result<std::vector<Eigen::Vector3f>> OptimizeImpl(
   path = optimizer.fillet(path, mesh, corridor, params, robot, trav);
   if (path.size() < 2u) return OptimizeFailure("filleting produced fewer than two points");
 
-  // Internal full-path safety re-check: sampling + placeability + traversable
-  // edges + curvature. If the local pipeline gets trapped by a corner, solve a
-  // sparse second-order path problem over the original safe polyline. The
-  // hierarchical planner independently verifies Portal crossing order.
-  bool safe = segments_safe(path);
-  float maximum_curvature = MaxCurvature(path);
+  // Final production stage: every returned segment must hug the real corridor
+  // mesh. Shortcut/funnel/smoothing are still free to move the guide, but their
+  // floating chords are now lifted onto the mesh and re-simplified under the
+  // strict path_surface_tolerance (never the 0.30 m endpoint radius). If the
+  // optimized guide cannot be lifted safely, the original surface A* polyline is
+  // lifted instead; a path is never accepted on the old 0.30 m tolerance.
   const bool fallback_enabled =
       params.shortcut_enabled || params.funnel_enabled || params.smoothing_enabled;
-  if (fallback_enabled && (!safe || maximum_curvature > robot.max_path_curvature)) {
+  std::vector<Eigen::Vector3f> surface_path;
+  bool safe = BuildSurfaceConstrainedPath(path, mesh, allowed, params, robot, trav,
+                                          ordered_portals, &surface_path);
+  if (!safe && fallback_enabled) {
+    // Prefer a curvature-constrained visibility path that is already restricted
+    // to the production surface tolerance. The regular fallback below keeps the
+    // wider endpoint-projection radius for slope transitions, but on branching
+    // scenes that radius lets a loose chord shortcut XY outside the corridor.
+    SafetyContext strict_ctx = ctx;
+    strict_ctx.project_tolerance = params.path_surface_tolerance;
+    strict_ctx.connect_tolerance =
+        std::min(params.max_project_radius,
+                 std::max(params.path_surface_tolerance, 2.0f * params.check_step));
+    // The final surface lift samples finer than check_step wherever the slope
+    // bound requires it. Match that interval here so an edge cannot hide a
+    // clearance violation between two coarse visibility samples.
+    strict_ctx.check_step = std::min(params.check_step, SurfaceLiftStep(params, trav));
+    std::vector<Eigen::Vector3f> strict_fallback =
+        CurvatureConstrainedFallback(raw, strict_ctx, robot.max_path_curvature);
+    const bool strict_portal_order_ok =
+        ordered_portals == nullptr ||
+        CrossesPortalSequence(strict_fallback, *ordered_portals);
+    if (!strict_fallback.empty() && strict_portal_order_ok) {
+      safe = BuildSurfaceConstrainedPath(strict_fallback, mesh, allowed, params, robot, trav,
+                                         ordered_portals, &surface_path);
+    }
+  }
+  if (!safe && fallback_enabled) {
+    // A second-order fallback over the original polyline, still lifted onto the
+    // real surface before it can become the result.
     std::vector<Eigen::Vector3f> fallback =
         CurvatureConstrainedFallback(raw, ctx, robot.max_path_curvature);
     const bool portal_order_ok =
         ordered_portals == nullptr || CrossesPortalSequence(fallback, *ordered_portals);
-    if (!fallback.empty() && portal_order_ok && segments_safe(fallback) &&
-        MaxCurvature(fallback) <= robot.max_path_curvature) {
-      path = std::move(fallback);
-      safe = true;
-      maximum_curvature = MaxCurvature(path);
+    if (!fallback.empty() && portal_order_ok) {
+      safe = BuildSurfaceConstrainedPath(fallback, mesh, allowed, params, robot, trav,
+                                         ordered_portals, &surface_path);
     }
   }
   if (!safe) {
-    return OptimizeFailure("optimized path fails the internal safety check");
+    // Last attempt: lift the untouched surface A* polyline. This is still the
+    // production optimizer's result path, not a bypass that returns the raw
+    // floating guide.
+    safe = BuildSurfaceConstrainedPath(raw, mesh, allowed, params, robot, trav,
+                                       ordered_portals, &surface_path);
   }
-  if (maximum_curvature > robot.max_path_curvature) {
-    return OptimizeFailure("optimized path exceeds robot.max_path_curvature");
+  if (!safe) {
+    return OptimizeFailure("optimized path cannot be constrained to the surface");
   }
+  path = std::move(surface_path);
   return path;
 }
 

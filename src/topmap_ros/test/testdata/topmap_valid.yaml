@@ -57,6 +57,7 @@ topmap:
     forbid_cross_regime_merge: true
   plan:
     max_project_radius: 0.30
+    path_surface_tolerance: 0.005
     max_project_normal_diff_deg: 45.0
     corridor_expansion_rings: 1
     fallback_full_mesh: true

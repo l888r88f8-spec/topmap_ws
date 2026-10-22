@@ -25,14 +25,18 @@ namespace topmap {
 //   * the crossed-Portal sequence must be verifiable against the topology.
 class SafetyValidator {
  public:
-  // Frozen A4.8 signature. Fills a structured report; malformed inputs (empty
-  // mesh, fewer than two points, non-finite point, non-positive check_step,
-  // invalid traversability parameters) yield `valid == false` rather than
-  // throwing. `violating_indices` holds the deduplicated input-vertex indices
-  // responsible for every failure.
-  PathValidationReport validate(const std::vector<Eigen::Vector3f>& path, const TriangleMesh& mesh,
-                                const TraversabilityParams& params, const RobotParams& robot,
-                                float check_step) const;
+  // Frozen A4.8 signature plus a strict final-output adherence tolerance. The
+  // default preserves every existing caller. `path_surface_tolerance` is a
+  // distance from every resampled segment interior to the real mesh, independent
+  // of the 0.30 m endpoint/waypoint localization radius; a floating simplified
+  // chord is rejected even when each endpoint is on the surface. Malformed inputs
+  // (empty mesh, fewer than two points, non-finite point, non-positive
+  // check_step/tolerance, invalid traversability parameters) yield `valid ==
+  // false` rather than throwing.
+  PathValidationReport validate(
+      const std::vector<Eigen::Vector3f>& path, const TriangleMesh& mesh,
+      const TraversabilityParams& params, const RobotParams& robot, float check_step,
+      float path_surface_tolerance = PlanParams{}.path_surface_tolerance) const;
 
   // T33: batch per-segment safety check used by Method A's graph builder. The
   // spatial index is built once and reused for every segment, so checking the

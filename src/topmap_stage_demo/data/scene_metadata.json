@@ -1,0 +1,58 @@
+{
+  "scene": "flat_H_ground_then_original_ramp_then_upper_platform",
+  "type": "program_generated_synthetic_scene",
+  "ground_H": {
+    "left_hall": [
+      0,
+      7,
+      0,
+      7,
+      0
+    ],
+    "connector": [
+      7,
+      10,
+      2.9,
+      4.1,
+      0
+    ],
+    "right_hall": [
+      10,
+      17,
+      0,
+      7,
+      0
+    ]
+  },
+  "ramp": {
+    "x_range": [
+      17,
+      26.4
+    ],
+    "y_range": [
+      2.9,
+      4.1
+    ],
+    "z_range": [
+      0,
+      2
+    ],
+    "horizontal_length_m": 9.4,
+    "width_m": 1.2,
+    "rise_m": 2,
+    "note": "Original ramp geometry retained; translated to connect at the right edge of the flat H-shaped ground."
+  },
+  "upper_platform": {
+    "x_range": [
+      26.4,
+      30.4
+    ],
+    "y_range": [
+      1.5,
+      5.5
+    ],
+    "z_m": 2
+  },
+  "grid_step_m": 0.1,
+  "point_count": 13349
+}

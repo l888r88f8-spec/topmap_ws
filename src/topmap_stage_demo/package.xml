@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>topmap_stage_demo</name>
+  <version>0.1.0</version>
+  <description>
+    Native ROS 2 demo that publishes every TopMap algorithm stage of one
+    synthetic scene OVERLAID at the same map origin, plus interactive
+    HierarchicalPlanner planning and an optional replay view. RViz layer trees let each stage or
+    planning layer be toggled independently.
+  </description>
+  <maintainer email="robot@example.com">robot</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- runtime dependencies -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>topmap_ros</exec_depend>
+  <exec_depend>topmap_msgs</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-yaml</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

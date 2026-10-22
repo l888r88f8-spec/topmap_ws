@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -59,6 +60,66 @@ Portal MakePortal(const Eigen::Vector3f& left, const Eigen::Vector3f& right) {
   return portal;
 }
 
+struct CreaseCrossing {
+  Eigen::Vector3f point = Eigen::Vector3f::Zero();
+  float segment_parameter = 0.0f;
+};
+
+// Independent geometry query: scans actual shared mesh edges whose two adjacent
+// face planes differ, then intersects those edge segments with the guide's XY
+// segment. The point is interpolated from the real edge endpoints, so a test can
+// demand the planner emit that exact edge point rather than a hard-coded x/z.
+std::vector<CreaseCrossing> CreaseCrossingsAlong(const TriangleMesh& mesh,
+                                                 const Eigen::Vector3f& from,
+                                                 const Eigen::Vector3f& to) {
+  std::vector<CreaseCrossing> crossings;
+  const Eigen::Vector2f a = from.head<2>();
+  const Eigen::Vector2f r = to.head<2>() - a;
+  for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
+    const topmap::TriangleNode& triangle = mesh.triangle(id);
+    for (const topmap::TriangleEdge& edge : triangle.edges) {
+      if (edge.neighbor == topmap::kInvalidId || edge.neighbor < id) continue;
+      const topmap::TriangleNode& neighbour = mesh.triangle(edge.neighbor);
+      // Only a real change of face plane is a terrain crease. Coplanar grid
+      // triangles (same plane, shared diagonal) are intentionally ignored.
+      if (triangle.normal.cross(neighbour.normal).norm() <= 1e-4f) continue;
+      const Eigen::Vector3f& e0 = mesh.vertices()[edge.v0];
+      const Eigen::Vector3f& e1 = mesh.vertices()[edge.v1];
+      const Eigen::Vector2f e0_2d = e0.head<2>();
+      const Eigen::Vector2f s = e1.head<2>() - e0_2d;
+      const float denominator = r.x() * s.y() - r.y() * s.x();
+      if (std::fabs(denominator) <= 1e-12f) continue;
+      const Eigen::Vector2f offset = e0_2d - a;
+      const float t = (offset.x() * s.y() - offset.y() * s.x()) / denominator;
+      const float u = (offset.x() * r.y() - offset.y() * r.x()) / denominator;
+      if (t < -1e-6f || t > 1.0f + 1e-6f || u < -1e-6f || u > 1.0f + 1e-6f) continue;
+      CreaseCrossing crossing;
+      crossing.segment_parameter = t;
+      crossing.point = e0 + u * (e1 - e0);
+      crossings.push_back(crossing);
+    }
+  }
+  std::sort(crossings.begin(), crossings.end(),
+            [](const CreaseCrossing& lhs, const CreaseCrossing& rhs) {
+              return lhs.segment_parameter < rhs.segment_parameter;
+            });
+  std::vector<CreaseCrossing> unique;
+  for (const CreaseCrossing& crossing : crossings) {
+    if (unique.empty() || (crossing.point - unique.back().point).norm() > 1e-5f) {
+      unique.push_back(crossing);
+    }
+  }
+  return unique;
+}
+
+float DistanceToPath(const std::vector<Eigen::Vector3f>& path, const Eigen::Vector3f& point) {
+  float best = std::numeric_limits<float>::infinity();
+  for (const Eigen::Vector3f& candidate : path) {
+    best = std::min(best, (candidate - point).norm());
+  }
+  return best;
+}
+
 float CurvatureAt(const Eigen::Vector3f& a, const Eigen::Vector3f& b, const Eigen::Vector3f& c) {
   const Eigen::Vector3f ab = a - b, cb = c - b;
   const float lab = ab.norm(), lcb = cb.norm(), lac = (c - a).norm();
@@ -93,6 +154,41 @@ TriangleId NearestTriangle(const TriangleMesh& mesh, const Eigen::Vector3f& p) {
 }
 
 constexpr float kFlatZ = 0.0f;
+
+// Independent point-to-surface measurement used by the adherence regressions.
+// It scans every mesh triangle (no optimizer/validator grid or projection
+// tolerance) so it cannot inherit the bug it is meant to catch.
+float DistanceToMesh(const TriangleMesh& mesh, const Eigen::Vector3f& p) {
+  float best = std::numeric_limits<float>::infinity();
+  for (TriangleId id = 0; id < static_cast<TriangleId>(mesh.size()); ++id) {
+    const topmap::TriangleNode& t = mesh.triangle(id);
+    best = std::min(best, topmap::pointTriangleDistance(
+                              p, mesh.vertices()[t.vertex_ids[0]],
+                              mesh.vertices()[t.vertex_ids[1]],
+                              mesh.vertices()[t.vertex_ids[2]]));
+  }
+  return best;
+}
+
+float MaxPathDistanceToMesh(const TriangleMesh& mesh, const std::vector<Eigen::Vector3f>& path,
+                            float step) {
+  float maximum = 0.0f;
+  for (const Eigen::Vector3f& point : path) {
+    maximum = std::max(maximum, DistanceToMesh(mesh, point));
+  }
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    const float length = (path[i + 1] - path[i]).norm();
+    int samples = static_cast<int>(std::ceil(length / step));
+    if (samples < 1) samples = 1;
+    for (int s = 1; s < samples; ++s) {
+      const float t = static_cast<float>(s) / static_cast<float>(samples);
+      maximum = std::max(maximum, DistanceToMesh(mesh, path[i] + t * (path[i + 1] - path[i])));
+    }
+  }
+  return maximum;
+}
+
+constexpr float kStrictSurfaceTolerance = 0.005f;
 
 }  // namespace
 
@@ -328,8 +424,15 @@ TEST(PathOptimizerTest, OptimizeAllSwitchesOffReturnsSafeInput) {
                                             {3.0f, 2.0f, kFlatZ}};
   const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
   ASSERT_TRUE(result.ok()) << result.status().message;
-  ASSERT_EQ(result.value().size(), raw.size());
-  for (std::size_t i = 0; i < raw.size(); ++i) EXPECT_TRUE(result.value()[i].isApprox(raw[i]));
+  // Even with every optional guide stage off, the final stage still lifts the
+  // returned path onto the real mesh. Without shortcutting the lifted path is
+  // dense rather than the three input vertices, but it must keep the exact
+  // endpoints and stay surface-adherent.
+  EXPECT_GE(result.value().size(), raw.size());
+  EXPECT_TRUE(result.value().front().isApprox(raw.front()));
+  EXPECT_TRUE(result.value().back().isApprox(raw.back()));
+  EXPECT_LE(MaxPathDistanceToMesh(mesh, result.value(), params.check_step),
+            kStrictSurfaceTolerance + 1e-4f);
 }
 
 TEST(PathOptimizerTest, OptimizeRejectsUnsafeCurvatureWhenSmoothingDisabled) {
@@ -370,10 +473,12 @@ TEST(PathOptimizerTest, OptimizeAppliesSmoothingAndFinalValidation) {
                                             {4.0f, 2.0f, kFlatZ}};
   const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
   ASSERT_TRUE(result.ok()) << result.status().message;
-  ASSERT_EQ(result.value().size(), raw.size());
+  EXPECT_GE(result.value().size(), raw.size());
   EXPECT_TRUE(result.value().front().isApprox(raw.front()));
   EXPECT_TRUE(result.value().back().isApprox(raw.back()));
   EXPECT_LE(MaxCurvature(result.value()), robot.max_path_curvature + 1e-5f);
+  EXPECT_LE(MaxPathDistanceToMesh(mesh, result.value(), params.check_step),
+            kStrictSurfaceTolerance + 1e-4f);
 }
 
 TEST(PathOptimizerTest, OptimizeRejectsInvalidParametersAndNonFinitePoints) {
@@ -437,15 +542,36 @@ TEST(PathOptimizerTest, OverloadUsesOrderedPortalsWhileFrozenSignatureSkipsFunne
 
   const auto frozen = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
   ASSERT_TRUE(frozen.ok()) << frozen.status().message;
-  EXPECT_EQ(frozen.value().size(), raw.size());
+  // Without Portal geometry the frozen signature cannot engage funnel; the
+  // dense lifted straight guide stays on y = 1.5.
+  float frozen_max_y = -std::numeric_limits<float>::infinity();
+  for (const auto& point : frozen.value()) frozen_max_y = std::max(frozen_max_y, point.y());
+  EXPECT_NEAR(frozen_max_y, 1.5f, 1e-3f);
 
   const auto overload =
       PathOptimizer().optimize(raw, mesh, corridor, portals, params, robot, trav);
   ASSERT_TRUE(overload.ok()) << overload.status().message;
-  EXPECT_LT(overload.value().size(), raw.size());
+  EXPECT_TRUE(overload.value().front().isApprox(raw.front()));
+  EXPECT_TRUE(overload.value().back().isApprox(raw.back()));
+  // Funnel must lift the guide through the Portal; the final surface stage may
+  // keep it dense (shortcutting is disabled here) but must not erase the gate.
+  float overload_max_y = -std::numeric_limits<float>::infinity();
+  for (const auto& point : overload.value()) {
+    overload_max_y = std::max(overload_max_y, point.y());
+  }
+  EXPECT_GT(overload_max_y, 1.9f);
+  EXPECT_GE(overload.value().size(), 3u);
+  EXPECT_LE(MaxPathDistanceToMesh(mesh, overload.value(), params.check_step),
+            kStrictSurfaceTolerance + 1e-4f);
 }
 
-TEST(PathOptimizerTest, OverloadRunsShortcutFunnelSmoothInOrder) {
+// A forced Portal at x = 3 that is at least 0.5 m off a straight guide forces a
+// detour which cannot cross the gate and stay under the default 0.25 1/m
+// curvature limit within the available x span. The optimizer must reject this
+// guide instead of returning a path that silently misses the Portal or exceeds
+// the curvature contract. (The earlier positive version of this test only
+// "succeeded" because smoothing dropped the Portal.)
+TEST(PathOptimizerTest, OverloadRejectsInfeasiblePortalCurvature) {
   auto mesh_result = BuildMesh(topmap::SyntheticScene::kFlatPlane);
   ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
   const TriangleMesh& mesh = mesh_result.value();
@@ -461,20 +587,14 @@ TEST(PathOptimizerTest, OverloadRunsShortcutFunnelSmoothInOrder) {
   const std::vector<Portal> portals = {MakePortal({3.0f, 3.0f, kFlatZ}, {3.0f, 2.0f, kFlatZ})};
 
   const auto result = PathOptimizer().optimize(raw, mesh, corridor, portals, params, robot, trav);
-  ASSERT_TRUE(result.ok()) << result.status().message;
-  ASSERT_EQ(result.value().size(), 3u);
-  EXPECT_TRUE(result.value().front().isApprox(raw.front()));
-  EXPECT_TRUE(result.value().back().isApprox(raw.back()));
-  // Funnel lifted the path to the gate; smooth kept a feasible corner.
-  EXPECT_GT(result.value()[1].y(), 1.5f);
-  EXPECT_LE(MaxCurvature(result.value()), robot.max_path_curvature + 1e-5f);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.status().code, ErrorCode::kPathOptimizationFailed);
 
+  // Rejection is deterministic; a second run must not fall back to the raw
+  // straight guide, which never crosses the forced Portal.
   const auto again = PathOptimizer().optimize(raw, mesh, corridor, portals, params, robot, trav);
-  ASSERT_TRUE(again.ok()) << again.status().message;
-  ASSERT_EQ(again.value().size(), result.value().size());
-  for (std::size_t i = 0; i < result.value().size(); ++i) {
-    EXPECT_TRUE(again.value()[i].isApprox(result.value()[i]));
-  }
+  ASSERT_FALSE(again.ok());
+  EXPECT_EQ(again.status().code, ErrorCode::kPathOptimizationFailed);
 }
 
 // T34: a 90-degree corner whose incident segments are long enough to hold the
@@ -586,6 +706,284 @@ TEST(PathOptimizerTest, FilletRejectsUTurn) {
   const auto out = PathOptimizer().fillet(raw, mesh, corridor, params, robot, trav);
   ASSERT_EQ(out.size(), raw.size());
   for (std::size_t i = 0; i < raw.size(); ++i) EXPECT_TRUE(out[i].isApprox(raw[i]));
+}
+
+// A guide whose straight XY chord crosses the U-shaped scene's hole cannot be
+// repaired by snapping to the nearest boundary: every sample must be contained
+// by a traversable triangle at its own XY.
+TEST(PathOptimizerTest, OptimizeRejectsGuideCrossingHole) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kUShape);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  PlanParams params;
+  params.shortcut_enabled = false;
+  params.funnel_enabled = false;
+  params.smoothing_enabled = false;
+  // Both endpoints are on the U, but the straight chord crosses the open void.
+  const std::vector<Eigen::Vector3f> raw = {{3.5f, 4.5f, kFlatZ}, {35.0f, 45.0f, kFlatZ}};
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.status().code, ErrorCode::kPathOptimizationFailed);
+}
+
+// A vertical guide between overlapping floors must not hop components just
+// because both floors contain the same XY.
+TEST(PathOptimizerTest, OptimizeRejectsCrossComponentVerticalGuide) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kOverlappingFloors);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  PlanParams params;
+  params.shortcut_enabled = false;
+  params.funnel_enabled = false;
+  params.smoothing_enabled = false;
+  const std::vector<Eigen::Vector3f> raw = {{2.5f, 2.5f, 0.0f}, {2.5f, 2.5f, 3.0f}};
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.status().code, ErrorCode::kPathOptimizationFailed);
+}
+
+// Multilayer/index-boundary regression: both floors contain the same XY, and the
+// guide starts exactly on a lattice line then crosses many index cells. Dense
+// sampling must stay on the lower layer selected by the first sample instead of
+// swapping to the upper floor at a cell boundary.
+TEST(PathOptimizerTest, OptimizeKeepsLowerLayerAcrossGridCellBoundaries) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kOverlappingFloors);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  PlanParams params;
+  params.shortcut_enabled = false;
+  params.funnel_enabled = false;
+  params.smoothing_enabled = false;
+  const std::vector<Eigen::Vector3f> raw = {{2.0f, 2.5f, kFlatZ},
+                                            {3.0f, 2.5f, kFlatZ},
+                                            {4.0f, 2.5f, kFlatZ}};
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_TRUE(result.ok()) << result.status().message;
+  ASSERT_GE(result.value().size(), 2u);
+  for (const Eigen::Vector3f& point : result.value()) {
+    EXPECT_NEAR(point.z(), kFlatZ, kStrictSurfaceTolerance + 1e-4f);
+  }
+  EXPECT_LE(MaxPathDistanceToMesh(mesh, result.value(), params.check_step),
+            kStrictSurfaceTolerance + 1e-4f);
+}
+
+// Regression: a sparse shortcut across the flat -> ramp crease can stay within
+// the 0.30 m endpoint-projection radius while floating almost 0.30 m above the
+// real surface. The final optimizer output must follow the mesh instead.
+TEST(PathOptimizerTest, OptimizeLiftsFloatingRampEntryChordToSurface) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kRamp);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  PlanParams params;
+  params.shortcut_enabled = false;
+  params.funnel_enabled = false;
+  params.smoothing_enabled = false;
+  const Eigen::Vector3f start(2.0f, 2.0f, 0.05f);
+  const Eigen::Vector3f ramp(7.4f, 2.0f, 0.7234043f);
+  const std::vector<Eigen::Vector3f> raw = {start, ramp};
+
+  // The raw chord is accepted by the old 0.30 m surface search: it floats
+  // ~0.299 m above the flat/ramp junction.
+  ASSERT_GT(MaxPathDistanceToMesh(mesh, raw, params.check_step), 0.20f);
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_TRUE(result.ok()) << result.status().message;
+  ASSERT_GE(result.value().size(), 2u);
+  EXPECT_LE(MaxPathDistanceToMesh(mesh, result.value(), params.check_step),
+            kStrictSurfaceTolerance + 1e-4f);
+  EXPECT_NEAR(result.value().front().x(), start.x(), 1e-4f);
+  EXPECT_NEAR(result.value().front().y(), start.y(), 1e-4f);
+  EXPECT_NEAR(result.value().back().x(), ramp.x(), 1e-4f);
+  EXPECT_NEAR(result.value().back().y(), ramp.y(), 1e-4f);
+}
+
+// Reverse travel must get the same surface adherence, including the same crease.
+TEST(PathOptimizerTest, OptimizeLiftsFloatingRampExitChordInReverse) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kRamp);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  PlanParams params;
+  params.shortcut_enabled = false;
+  params.funnel_enabled = false;
+  params.smoothing_enabled = false;
+  const Eigen::Vector3f ramp(7.4f, 2.0f, 0.7234043f);
+  const Eigen::Vector3f start(2.0f, 2.0f, 0.05f);
+  const std::vector<Eigen::Vector3f> raw = {ramp, start};
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_TRUE(result.ok()) << result.status().message;
+  EXPECT_LE(MaxPathDistanceToMesh(mesh, result.value(), params.check_step),
+            kStrictSurfaceTolerance + 1e-4f);
+  EXPECT_NEAR(result.value().front().x(), ramp.x(), 1e-4f);
+  EXPECT_NEAR(result.value().back().x(), start.x(), 1e-4f);
+}
+
+// RED regression for the approved crease-preserving path: the guide crosses two
+// real shared edges where the flat/ramp and ramp/platform planes change. With
+// default optimizations the returned path must contain the exact mesh edge
+// intersections (the foot and top of the ramp), not merely points sampled close
+// to them. The expected points are computed from the mesh edges themselves.
+TEST(PathOptimizerTest, OptimizePreservesExactRampFootAndTopCreases) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kRamp);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  const PlanParams params;  // default shortcut/funnel/smoothing stay enabled
+  const std::vector<Eigen::Vector3f> raw = {{2.0f, 2.0f, 0.05f},
+                                            {3.9f, 2.0f, 0.0f},
+                                            {8.0f, 2.0f, 0.8510638f},
+                                            {13.5f, 2.0f, 2.0f},
+                                            {15.4f, 2.0f, 2.0f}};
+  const auto crossings = CreaseCrossingsAlong(mesh, raw.front(), raw.back());
+  ASSERT_GE(crossings.size(), 2u) << "synthetic ramp lost its detected creases";
+  // The guide crosses the foot first and the top last.
+  const std::vector<Eigen::Vector3f> expected = {crossings.front().point,
+                                                 crossings.back().point};
+  ASSERT_NEAR(expected.front().z(), 0.0f, 1e-5f);
+  ASSERT_NEAR(expected.back().z(), 2.0f, 1e-5f);
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_TRUE(result.ok()) << result.status().message;
+  EXPECT_LE(MaxPathDistanceToMesh(mesh, result.value(), params.check_step),
+            kStrictSurfaceTolerance + 1e-4f);
+  for (const Eigen::Vector3f& crease : expected) {
+    EXPECT_LE(DistanceToPath(result.value(), crease), 1e-5f)
+        << "missing exact crease point [" << crease.x() << ',' << crease.y() << ','
+        << crease.z() << ']';
+  }
+}
+
+// Reverse travel must keep the same exact crease points; the intersection order
+// and the guide direction are reversed, not the geometry contract.
+TEST(PathOptimizerTest, OptimizePreservesExactRampCreasesInReverse) {
+  auto mesh_result = BuildMesh(topmap::SyntheticScene::kRamp);
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  const TriangleMesh& mesh = mesh_result.value();
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  const TraversabilityParams trav;
+  const PlanParams params;
+  const std::vector<Eigen::Vector3f> forward = {{2.0f, 2.0f, 0.05f},
+                                                {3.9f, 2.0f, 0.0f},
+                                                {8.0f, 2.0f, 0.8510638f},
+                                                {13.5f, 2.0f, 2.0f},
+                                                {15.4f, 2.0f, 2.0f}};
+  std::vector<Eigen::Vector3f> raw(forward.rbegin(), forward.rend());
+  const auto crossings = CreaseCrossingsAlong(mesh, raw.front(), raw.back());
+  ASSERT_GE(crossings.size(), 2u);
+  const std::vector<Eigen::Vector3f> expected = {crossings.front().point,
+                                                 crossings.back().point};
+  ASSERT_NEAR(expected.front().z(), 2.0f, 1e-5f);
+  ASSERT_NEAR(expected.back().z(), 0.0f, 1e-5f);
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_TRUE(result.ok()) << result.status().message;
+  EXPECT_LE(MaxPathDistanceToMesh(mesh, result.value(), params.check_step),
+            kStrictSurfaceTolerance + 1e-4f);
+  for (const Eigen::Vector3f& crease : expected) {
+    EXPECT_LE(DistanceToPath(result.value(), crease), 1e-5f)
+        << "missing exact reverse crease point [" << crease.x() << ',' << crease.y()
+        << ',' << crease.z() << ']';
+  }
+}
+
+// Regression for the indexed-containment review finding: a very acute triangle
+// can contain (within ContainsXy's relative epsilon) a point that lies just
+// outside its XY AABB. The previous epsilon/min-edge margin registered the
+// triangle one cell late, so the surface lift missed it (origin=-1, cell=1).
+// The point below is accepted by the same signed-edge test, and this guide's
+// first sample is exactly that point.
+TEST(PathOptimizerTest, OptimizeFindsAcuteTriangleAcceptedOutsideItsCellAabb) {
+  topmap::MeshData data;
+  data.vertices = {
+      // A helper triangle fixes the index origin at x=-1 and keeps the median
+      // edge length at 1.0 m without touching the acute triangle.
+      {-1.0f, 0.0f, 0.0f},
+      {-1.0f, 1.0f, 0.0f},
+      {0.0f, 1.0f, 0.0f},
+      // The review counterexample: a ~0.57 degree wedge.
+      {0.00015f, 0.0f, 0.0f},
+      {1.00015f, 0.0f, 0.0f},
+      {1.00015f, 0.01f, 0.0f},
+  };
+  data.faces = {{0, 1, 2}, {3, 4, 5}};
+  auto mesh_result = TriangleMesh::fromMeshData(data, {});
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  TriangleMesh& mesh = mesh_result.value();
+  TraversabilityParams trav;
+  trav.required_clearance = 0.0f;
+  TraversabilityEvaluator::apply(mesh, trav);
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  PlanParams params;
+  params.shortcut_enabled = false;
+  params.funnel_enabled = false;
+  params.smoothing_enabled = false;
+  const std::vector<Eigen::Vector3f> raw = {{-0.00001f, -0.0000009f, 0.0f},
+                                            {0.0005f, 0.000001f, 0.0f}};
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_TRUE(result.ok()) << result.status().message;
+  ASSERT_GE(result.value().size(), 2u);
+  EXPECT_NEAR(result.value().front().x(), raw.front().x(), 1e-6f);
+  EXPECT_NEAR(result.value().front().y(), raw.front().y(), 1e-6f);
+}
+
+// RED regression for the fast crease candidate: a same-component 6 mm hole is
+// small enough that a straight endpoint chord is within the 0.30 m projection
+// radius, so the old endpoint-only segment check accepts it. The candidate must
+// be lifted at the strict SurfaceLiftStep sampling interval first; the midpoint
+// lies over the hole and has no containing triangle, so optimize must fail
+// rather than return a path that bridges the void.
+TEST(PathOptimizerTest, OptimizeRejectsGuideCrossingTinySixMillimetreHole) {
+  topmap::MeshData data;
+  data.vertices = {{-1.0f, -1.0f, 0.0f}, {1.0f, -1.0f, 0.0f},
+                   {1.0f, 1.0f, 0.0f},   {-1.0f, 1.0f, 0.0f},
+                   {-0.003f, -0.003f, 0.0f}, {0.003f, -0.003f, 0.0f},
+                   {0.003f, 0.003f, 0.0f},   {-0.003f, 0.003f, 0.0f}};
+  data.faces = {{0, 1, 5}, {0, 5, 4}, {1, 2, 6}, {1, 6, 5},
+                {2, 3, 7}, {2, 7, 6}, {3, 0, 4}, {3, 4, 7}};
+  auto mesh_result = TriangleMesh::fromMeshData(data, {});
+  ASSERT_TRUE(mesh_result.ok()) << mesh_result.status().message;
+  TriangleMesh& mesh = mesh_result.value();
+  TraversabilityParams trav;
+  trav.required_clearance = 0.0f;
+  TraversabilityEvaluator::apply(mesh, trav);
+  const Corridor corridor = MakeCorridor(mesh);
+  const RobotParams robot;
+  PlanParams params;
+  params.shortcut_enabled = false;
+  params.funnel_enabled = false;
+  params.smoothing_enabled = false;
+  // Both endpoints are on the same mesh component; only the 6 mm interior hole
+  // separates them. The chord midpoint is (0, 0) in the hole.
+  const std::vector<Eigen::Vector3f> raw = {{-0.014f, 0.0f, 0.0f},
+                                            {0.014f, 0.0f, 0.0f}};
+
+  const auto result = PathOptimizer().optimize(raw, mesh, corridor, params, robot, trav);
+  ASSERT_FALSE(result.ok())
+      << "optimizer accepted a straight chord across the 6 mm hole";
+  EXPECT_EQ(result.status().code, ErrorCode::kPathOptimizationFailed);
 }
 
 // T34: a nearly collinear corner is not a violating corner and must not be

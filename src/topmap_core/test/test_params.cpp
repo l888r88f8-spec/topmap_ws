@@ -98,6 +98,7 @@ TEST(ParamsTest, LoadsAllSections) {
   EXPECT_FALSE(c.compression.preserve_topology);
   EXPECT_FALSE(c.compression.forbid_cross_regime_merge);  // R12-b: value comes from YAML
   EXPECT_FLOAT_EQ(c.plan.max_project_radius, 0.35f);
+  EXPECT_FLOAT_EQ(c.plan.path_surface_tolerance, 0.006f);
   EXPECT_FLOAT_EQ(c.plan.max_project_normal_diff_deg, 50.0f);
   EXPECT_EQ(c.plan.corridor_expansion_rings, 2);
   EXPECT_FALSE(c.plan.fallback_full_mesh);

@@ -172,10 +172,17 @@ Result<TopmapConfig> loadTopmapConfigImpl(const std::string& path) {
   n = t["plan"];
   if (auto s = requireMap(n, "topmap.plan"); !s.ok()) return s;
   if (auto s = rejectUnknown(n, "topmap.plan",
-      {"max_project_radius", "max_project_normal_diff_deg", "corridor_expansion_rings",
-       "fallback_full_mesh", "shortcut_enabled", "funnel_enabled", "smoothing_enabled",
-       "smoothing_iterations", "check_step", "topology_weight"}); !s.ok()) return s;
+      {"max_project_radius", "path_surface_tolerance", "max_project_normal_diff_deg",
+       "corridor_expansion_rings", "fallback_full_mesh", "shortcut_enabled", "funnel_enabled",
+       "smoothing_enabled", "smoothing_iterations", "check_step", "topology_weight"}); !s.ok())
+    return s;
   REQ(c.plan.max_project_radius, n, "max_project_radius", "topmap.plan");
+  // Backward-compatible incremental key: an older config that omits it keeps the
+  // safe default instead of being rejected, while an explicit value is read and
+  // range-checked like every other planning parameter.
+  if (n["path_surface_tolerance"]) {
+    REQ(c.plan.path_surface_tolerance, n, "path_surface_tolerance", "topmap.plan");
+  }
   REQ(c.plan.max_project_normal_diff_deg, n, "max_project_normal_diff_deg", "topmap.plan");
   REQ_I(c.plan.corridor_expansion_rings, n, "corridor_expansion_rings", "topmap.plan");
   REQ_B(c.plan.fallback_full_mesh, n, "fallback_full_mesh", "topmap.plan");
@@ -205,6 +212,9 @@ Result<TopmapConfig> loadTopmapConfigImpl(const std::string& path) {
                          "topmap.region.region_score_threshold must be in [0,1]");  // R1 normalized
   if (c.plan.check_step <= 0.0f)
     return Status::Error(ErrorCode::kInvalidArgument, "topmap.plan.check_step must be positive");
+  if (!std::isfinite(c.plan.path_surface_tolerance) || c.plan.path_surface_tolerance <= 0.0f)
+    return Status::Error(ErrorCode::kInvalidArgument,
+                         "topmap.plan.path_surface_tolerance must be finite and positive");
   return c;
 }
 }  // namespace

@@ -25,9 +25,9 @@ constexpr float kDuplicateEpsilon = 1e-6f;
 // far below any physically meaningful margin.
 constexpr float kSlopeEpsilonDeg = 1e-3f;
 constexpr float kCurvatureEpsilon = 1e-3f;
-// The frozen validate() signature removed PlanParams, so the projection radius
-// cannot be threaded through. Use the same default SurfaceAStar falls back to
-// (documented deviation) instead of inventing a second constant.
+// Endpoint/waypoint localization radius. This is intentionally separate from
+// the strict path_surface_tolerance below: it may snap a requested endpoint to
+// the mesh, but it must never authorize a floating interior chord.
 const float kProjectionTolerance = PlanParams{}.max_project_radius;
 // Boundary-chain crossing tolerance, in metres. A crossing is a geometric
 // intersection; this only absorbs float round-off and the second-order miss of a
@@ -402,14 +402,19 @@ bool LocatePlaceable(const MeshGrid& grid, const TriangleMesh& mesh,
   return true;
 }
 
-// kappa = 2*sin(angle at B)/|AC| == 2*|BA x BC| / (|BA|*|BC|*|AC|).
+// Ground-steering (yaw) curvature: kappa = 2*sin(angle at B)/|AC| measured in
+// the XY travel plane. A real mesh crease produces a 3D pitch corner that is a
+// legitimate ground-vehicle slope change, not steering curvature; a genuine
+// left/right bend still yields the same value as the 3D formula on flat ground.
 float CurvatureAt(const Eigen::Vector3f& a, const Eigen::Vector3f& b, const Eigen::Vector3f& c) {
-  const Eigen::Vector3f ba = a - b, bc = c - b;
-  const float lab = ba.norm(), lbc = bc.norm(), lac = (c - a).norm();
+  const Eigen::Vector2f ba(a.x() - b.x(), a.y() - b.y());
+  const Eigen::Vector2f bc(c.x() - b.x(), c.y() - b.y());
+  const Eigen::Vector2f ca(c.x() - a.x(), c.y() - a.y());
+  const float lab = ba.norm(), lbc = bc.norm(), lac = ca.norm();
   if (lab <= kDuplicateEpsilon || lbc <= kDuplicateEpsilon || lac <= kDuplicateEpsilon) {
     return 0.0f;
   }
-  return 2.0f * ba.cross(bc).norm() / (lab * lbc * lac);
+  return 2.0f * std::fabs(ba.x() * bc.y() - ba.y() * bc.x()) / (lab * lbc * lac);
 }
 
 // A sample plus the index of the input vertex it is attributed to.
@@ -524,12 +529,14 @@ bool SegmentSampledSafe(const MeshGrid& grid, const TriangleMesh& mesh,
 PathValidationReport SafetyValidator::validate(const std::vector<Eigen::Vector3f>& path,
                                                const TriangleMesh& mesh,
                                                const TraversabilityParams& params,
-                                               const RobotParams& robot, float check_step) const {
+                                               const RobotParams& robot, float check_step,
+                                               float path_surface_tolerance) const {
   PathValidationReport report;
   const std::size_t count = path.size();
 
   bool invalid = false;
   if (!IsFinite(check_step) || !(check_step > 0.0f)) invalid = true;
+  if (!IsFinite(path_surface_tolerance) || !(path_surface_tolerance > 0.0f)) invalid = true;
   if (!IsFinite(robot.max_path_curvature) || !(robot.max_path_curvature > 0.0f)) invalid = true;
   if (!ValidateTraversabilityParams(params).ok()) invalid = true;
   if (mesh.size() == 0) invalid = true;
@@ -578,6 +585,13 @@ PathValidationReport SafetyValidator::validate(const std::vector<Eigen::Vector3f
     const TriangleNode& nearest_triangle = mesh.triangle(nearest);
     report.min_clearance = std::min(report.min_clearance, nearest_triangle.min_clearance);
     any_located = true;
+    // Strict adherence applies to the complete segment interior, not only to the
+    // retained vertices: every resampled point must be within the dedicated
+    // final-output tolerance of the real mesh. The 0.30 m localization radius
+    // above only decides which triangle is the candidate.
+    if (!IsFinite(nearest_distance) || nearest_distance > path_surface_tolerance) {
+      record(samples[k].source);
+    }
     if (!TraversabilityEvaluator::isRobotPlaceable(nearest_triangle, params) ||
         nearest_triangle.normal.dot(point - nearest_triangle.centroid) < -params.max_step_height) {
       record(samples[k].source);
